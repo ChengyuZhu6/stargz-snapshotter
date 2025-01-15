@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/util/cacheutil"
 	"github.com/containerd/stargz-snapshotter/util/namedmutex"
 )
@@ -248,36 +249,45 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get blob path from database: %w", err)
 	}
-	if !exists {
-		return nil, fmt.Errorf("blob %q not found in cache", key)
-	}
-
+	targetPath := dc.cachePath(key)
 	// Open the cache file using the path from database
-	file, err := os.Open(filePath)
+	targetfile, err := os.Open(targetPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
+	}
+	if exists {
+		sourcefile, err := os.Open(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
+		}
+		log.L.Info("Blob found in database, using cache path", "filePath", filePath)
+		fileInfo, err := sourcefile.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("failed to stat source cached file: %w", err)
+		}
+		CopyFileRange(sourcefile, 0, targetfile, 0, fileInfo.Size())
 	}
 
 	// If "direct" option is specified, do not cache the file on memory
 	if dc.direct || opt.direct {
 		return &reader{
-			ReaderAt: file,
+			ReaderAt: targetfile,
 			closeFunc: func() error {
 				if opt.passThrough {
 					return nil
 				}
-				return file.Close()
+				return targetfile.Close()
 			},
 		}, nil
 	}
 
 	return &reader{
-		ReaderAt: file,
+		ReaderAt: targetfile,
 		closeFunc: func() error {
-			_, done, added := dc.fileCache.Add(key, file)
+			_, done, added := dc.fileCache.Add(key, targetfile)
 			defer done() // Release it immediately. Cleaned up on eviction.
 			if !added {
-				return file.Close() // file already exists in the cache. close it.
+				return targetfile.Close() // file already exists in the cache. close it.
 			}
 			return nil
 		},

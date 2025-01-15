@@ -19,11 +19,13 @@ package cache
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
 	"github.com/containerd/log"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -297,4 +299,13 @@ func GetCacheDB(rootDir string) (*CacheDb, error) {
 		log.L.Info("NewCacheDB", "rootDir", rootDir)
 	})
 	return globalDB, globalDBErr
+}
+
+// CopyFileRange copies data between files using copy_file_range syscall on Linux
+func CopyFileRange(srcFile *os.File, srcOffset int64, dstFile *os.File, dstOffset int64, length int64) (uint64, error) {
+	written, err := unix.CopyFileRange(int(srcFile.Fd()), &srcOffset, int(dstFile.Fd()), &dstOffset, int(length), 0)
+	if err != nil {
+		return 0, fmt.Errorf("copy_file_range failed: %v", err)
+	}
+	return uint64(written), nil
 }
