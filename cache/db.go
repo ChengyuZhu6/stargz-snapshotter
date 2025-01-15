@@ -14,13 +14,12 @@
    limitations under the License.
 */
 
-package dedup
+package cache
 
 import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
-	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -28,7 +27,6 @@ import (
 // CacheDb represents a content-addressable storage database
 type CacheDb struct {
 	db   *sql.DB
-	mu   sync.Mutex
 	path string
 }
 
@@ -48,14 +46,14 @@ func FromFile(dbPath string) (*CacheDb, error) {
 	// Create tables if they don't exist
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS Blobs (
-			BlobId     INTEGER PRIMARY KEY,
+			BlobId     TEXT PRIMARY KEY,
 			FilePath   TEXT NOT NULL UNIQUE
 		);
 		
 		CREATE TABLE IF NOT EXISTS Chunks (
 			ChunkId           TEXT NOT NULL,
 			ChunkOffset       INTEGER,
-			BlobId            INTEGER,
+			BlobId            TEXT,
 			UNIQUE(ChunkId, BlobId) ON CONFLICT IGNORE,
 			FOREIGN KEY(BlobId) REFERENCES Blobs(BlobId)
 		);
@@ -74,20 +72,20 @@ func FromFile(dbPath string) (*CacheDb, error) {
 }
 
 // GetBlobID retrieves the blob ID for a given path
-func (c *CacheDb) GetBlobID(blob string) (uint64, bool, error) {
-	var id uint64
+func (c *CacheDb) GetBlobID(blob string) (string, bool, error) {
+	var id string
 	err := c.db.QueryRow("SELECT BlobId FROM Blobs WHERE FilePath = ?", blob).Scan(&id)
 	if err == sql.ErrNoRows {
-		return 0, false, nil
+		return "", false, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return "", false, err
 	}
 	return id, true, nil
 }
 
 // GetBlobPath retrieves the file path for a given blob ID
-func (c *CacheDb) GetBlobPath(id uint64) (string, bool, error) {
+func (c *CacheDb) GetBlobPath(id string) (string, bool, error) {
 	var path string
 	err := c.db.QueryRow("SELECT FilePath FROM Blobs WHERE BlobId = ?", id).Scan(&path)
 	if err == sql.ErrNoRows {
@@ -101,7 +99,7 @@ func (c *CacheDb) GetBlobPath(id uint64) (string, bool, error) {
 
 // GetAllBlobs retrieves all blobs from the database
 func (c *CacheDb) GetAllBlobs() ([]struct {
-	ID   uint64
+	ID   string
 	Path string
 }, error) {
 	rows, err := c.db.Query("SELECT BlobId, FilePath FROM Blobs")
@@ -111,13 +109,13 @@ func (c *CacheDb) GetAllBlobs() ([]struct {
 	defer rows.Close()
 
 	var results []struct {
-		ID   uint64
+		ID   string
 		Path string
 	}
 
 	for rows.Next() {
 		var result struct {
-			ID   uint64
+			ID   string
 			Path string
 		}
 		if err := rows.Scan(&result.ID, &result.Path); err != nil {
@@ -151,14 +149,13 @@ func (c *CacheDb) AddBlobs(blobs []string) error {
 	return tx.Commit()
 }
 
-// AddBlob adds a single blob and returns its ID
-func (c *CacheDb) AddBlob(blob string) (uint64, error) {
-	result, err := c.db.Exec("INSERT OR IGNORE INTO Blobs (FilePath) VALUES (?)", blob)
+// AddBlob adds a single blob with the given ID and file path
+func (c *CacheDb) AddBlob(blobID string, filePath string) (string, error) {
+	_, err := c.db.Exec("INSERT OR IGNORE INTO Blobs (BlobId, FilePath) VALUES (?, ?)", blobID, filePath)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	id, err := result.LastInsertId()
-	return uint64(id), err
+	return blobID, nil
 }
 
 // DeleteBlobs removes multiple blobs and their associated chunks
@@ -170,7 +167,7 @@ func (c *CacheDb) DeleteBlobs(blobs []string) error {
 	defer tx.Rollback()
 
 	for _, blob := range blobs {
-		var id uint64
+		var id string
 		err := tx.QueryRow("SELECT BlobId FROM Blobs WHERE FilePath = ?", blob).Scan(&id)
 		if err == sql.ErrNoRows {
 			continue
@@ -225,7 +222,7 @@ func (c *CacheDb) AddChunks(chunks []struct {
 	defer tx.Rollback()
 
 	for _, chunk := range chunks {
-		var blobID uint64
+		var blobID string
 		err := tx.QueryRow("SELECT BlobId FROM Blobs WHERE FilePath = ?", chunk.BlobPath).Scan(&blobID)
 		if err != nil {
 			return err
@@ -250,7 +247,7 @@ func (c *CacheDb) AddChunk(chunkID string, chunkOffset uint64, blobPath string) 
 	}
 	defer tx.Rollback()
 
-	var blobID uint64
+	var blobID string
 	err = tx.QueryRow("SELECT BlobId FROM Blobs WHERE FilePath = ?", blobPath).Scan(&blobID)
 	if err != nil {
 		return err
