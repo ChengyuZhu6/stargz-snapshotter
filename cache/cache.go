@@ -130,6 +130,13 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	if !filepath.IsAbs(directory) {
 		return nil, fmt.Errorf("dir cache path must be an absolute path; got %q", directory)
 	}
+
+	// Get global CacheDb instance
+	db, err := GetCacheDB(directory)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cache database: %w", err)
+	}
+
 	bufPool := config.BufPool
 	if bufPool == nil {
 		bufPool = &sync.Pool{
@@ -167,18 +174,6 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	wipdir := filepath.Join(directory, "wip")
 	if err := os.MkdirAll(wipdir, 0700); err != nil {
 		return nil, err
-	}
-
-	var db *CacheDb
-	if config.CacheDb == nil {
-		// Create new CacheDb if not provided
-		var err error
-		db, err = NewCacheDb(directory)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create cache database: %w", err)
-		}
-	} else {
-		db = config.CacheDb
 	}
 
 	dc := &directoryCache{

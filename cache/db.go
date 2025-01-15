@@ -20,14 +20,22 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
+)
+
+var (
+	globalDB     *CacheDb
+	globalDBOnce sync.Once
+	globalDBErr  error
 )
 
 // CacheDb represents a content-addressable storage database
 type CacheDb struct {
 	db   *sql.DB
 	path string
+	mu   sync.RWMutex
 }
 
 // NewCacheDb creates a new Cache database at the specified path
@@ -73,6 +81,9 @@ func FromFile(dbPath string) (*CacheDb, error) {
 
 // GetBlobID retrieves the blob ID for a given path
 func (c *CacheDb) GetBlobID(blob string) (string, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	var id string
 	err := c.db.QueryRow("SELECT BlobId FROM Blobs WHERE FilePath = ?", blob).Scan(&id)
 	if err == sql.ErrNoRows {
@@ -86,6 +97,9 @@ func (c *CacheDb) GetBlobID(blob string) (string, bool, error) {
 
 // GetBlobPath retrieves the file path for a given blob ID
 func (c *CacheDb) GetBlobPath(id string) (string, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	var path string
 	err := c.db.QueryRow("SELECT FilePath FROM Blobs WHERE BlobId = ?", id).Scan(&path)
 	if err == sql.ErrNoRows {
@@ -102,6 +116,9 @@ func (c *CacheDb) GetAllBlobs() ([]struct {
 	ID   string
 	Path string
 }, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	rows, err := c.db.Query("SELECT BlobId, FilePath FROM Blobs")
 	if err != nil {
 		return nil, err
@@ -151,6 +168,9 @@ func (c *CacheDb) AddBlobs(blobs []string) error {
 
 // AddBlob adds a single blob with the given ID and file path
 func (c *CacheDb) AddBlob(blobID string, filePath string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	_, err := c.db.Exec("INSERT OR IGNORE INTO Blobs (BlobId, FilePath) VALUES (?, ?)", blobID, filePath)
 	if err != nil {
 		return "", err
@@ -266,4 +286,12 @@ func (c *CacheDb) AddChunk(chunkID string, chunkOffset uint64, blobPath string) 
 // Close closes the database connection
 func (c *CacheDb) Close() error {
 	return c.db.Close()
+}
+
+// GetCacheDB returns the global singleton instance of CacheDb
+func GetCacheDB(rootDir string) (*CacheDb, error) {
+	globalDBOnce.Do(func() {
+		globalDB, globalDBErr = NewCacheDb(rootDir)
+	})
+	return globalDB, globalDBErr
 }

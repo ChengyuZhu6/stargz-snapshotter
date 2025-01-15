@@ -43,7 +43,7 @@ func TestCacheDb(t *testing.T) {
 	// Test getting blob ID
 	id, exists, err := db.GetBlobID("/tmp/blob1")
 	if err != nil || !exists {
-		t.Errorf("Expected blob1 id=1, got id=%d, exists=%v, err=%v", id, exists, err)
+		t.Errorf("Expected blob1 to exist, got id=%q, exists=%v, err=%v", id, exists, err)
 	}
 
 	// Add more tests as needed...
