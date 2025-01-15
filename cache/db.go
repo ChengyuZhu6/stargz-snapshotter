@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/containerd/log"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -290,8 +291,10 @@ func (c *CacheDb) Close() error {
 
 // GetCacheDB returns the global singleton instance of CacheDb
 func GetCacheDB(rootDir string) (*CacheDb, error) {
+	log.L.Info("GetCacheDB", "rootDir", rootDir)
 	globalDBOnce.Do(func() {
 		globalDB, globalDBErr = NewCacheDb(rootDir)
+		log.L.Info("NewCacheDB", "rootDir", rootDir)
 	})
 	return globalDB, globalDBErr
 }
