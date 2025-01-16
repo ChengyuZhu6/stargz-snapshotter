@@ -19,6 +19,7 @@ package cache
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -303,10 +304,110 @@ func GetCacheDB(rootDir string) (*CacheDb, error) {
 
 // CopyFileRange copies data between files using copy_file_range syscall on Linux
 func CopyFileRange(srcFile *os.File, srcOffset int64, dstFile *os.File, dstOffset int64, length int64) (uint64, error) {
-	written, err := unix.CopyFileRange(int(srcFile.Fd()), &srcOffset, int(dstFile.Fd()), &dstOffset, int(length), 0)
-	log.L.Info("CopyFileRange", "srcFile", srcFile, "srcOffset", srcOffset, "dstFile", dstFile, "dstOffset", dstOffset, "length", length, "written", written, "err", err)
-	if err != nil {
-		return 0, fmt.Errorf("copy_file_range failed: %v", err)
+	// Validate parameters
+	if srcFile == nil || dstFile == nil {
+		return 0, fmt.Errorf("invalid file descriptor: source or destination file is nil")
 	}
-	return uint64(written), nil
+	if length <= 0 {
+		return 0, fmt.Errorf("invalid length: %d", length)
+	}
+	if srcOffset < 0 || dstOffset < 0 {
+		return 0, fmt.Errorf("negative offset not allowed: src=%d dst=%d", srcOffset, dstOffset)
+	}
+
+	// Check if files are regular files
+	srcStat, err := srcFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat source file: %w", err)
+	}
+	dstStat, err := dstFile.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat destination file: %w", err)
+	}
+
+	// Log file types and modes
+	log.L.Debug("File types",
+		"srcPath", srcFile.Name(),
+		"srcMode", srcStat.Mode().String(),
+		"srcIsRegular", srcStat.Mode().IsRegular(),
+		"dstPath", dstFile.Name(),
+		"dstMode", dstStat.Mode().String(),
+		"dstIsRegular", dstStat.Mode().IsRegular())
+
+	// Initialize variables before any goto statements
+	var isXFS bool
+	var statfs unix.Statfs_t
+
+	// Get filesystem info
+	if err := unix.Fstatfs(int(dstFile.Fd()), &statfs); err != nil {
+		log.L.Debug("failed to get filesystem info, falling back to manual copy", "error", err)
+		goto fallback
+	}
+
+	// Check if it's XFS
+	isXFS = statfs.Type == 0x58465342 // XFS_SUPER_MAGIC
+
+	// Try copy_file_range if conditions are met
+	if srcStat.Mode().IsRegular() && dstStat.Mode().IsRegular() {
+		// Align offset to filesystem block size for XFS
+		if isXFS {
+			blockSize := int64(statfs.Bsize)
+			srcOffset = (srcOffset + blockSize - 1) &^ (blockSize - 1)
+			dstOffset = (dstOffset + blockSize - 1) &^ (blockSize - 1)
+		}
+
+		written, err := unix.CopyFileRange(int(srcFile.Fd()), &srcOffset, int(dstFile.Fd()), &dstOffset, int(length), 0)
+		if err == nil {
+			return uint64(written), nil
+		}
+		log.L.Debug("copy_file_range failed",
+			"error", err,
+			"isXFS", isXFS,
+			"srcSize", srcStat.Size(),
+			"length", length)
+	}
+
+fallback:
+	// Manual copy with optimized buffer size
+	bufSize := 1024 * 1024 // 1MB default
+	if isXFS {
+		// Use larger buffer for XFS, aligned to block size
+		bufSize = 2 * 1024 * 1024 // 2MB for XFS
+		if blockSize := int(statfs.Bsize); blockSize > 0 {
+			bufSize = (bufSize + blockSize - 1) &^ (blockSize - 1)
+		}
+	}
+	buf := make([]byte, bufSize)
+	var totalWritten int64
+
+	for totalWritten < length {
+		n := length - totalWritten
+		if n > int64(len(buf)) {
+			n = int64(len(buf))
+		}
+
+		nr, err := srcFile.ReadAt(buf[:n], srcOffset+totalWritten)
+		if err != nil && err != io.EOF {
+			return uint64(totalWritten), fmt.Errorf("read error at offset %d: %w", srcOffset+totalWritten, err)
+		}
+		if nr == 0 {
+			break
+		}
+
+		nw, err := dstFile.WriteAt(buf[:nr], dstOffset+totalWritten)
+		if err != nil {
+			return uint64(totalWritten), fmt.Errorf("write error at offset %d: %w", dstOffset+totalWritten, err)
+		}
+
+		totalWritten += int64(nw)
+		if nr < int(n) || totalWritten >= length {
+			break
+		}
+	}
+
+	log.L.Debug("Manual copy completed",
+		"totalWritten", totalWritten,
+		"requestedLength", length,
+		"isXFS", isXFS)
+	return uint64(totalWritten), nil
 }

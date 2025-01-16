@@ -250,22 +250,42 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		return nil, fmt.Errorf("failed to get blob path from database: %w", err)
 	}
 	targetPath := dc.cachePath(key)
-	// Open the cache file using the path from database
-	targetfile, err := os.Open(targetPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
+
+	// Ensure target directory exists
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
+
+	// Open or create target file with write permissions
+	targetfile, err := os.OpenFile(targetPath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open/create blob file for %q: %w", key, err)
+	}
+
 	if exists {
 		sourcefile, err := os.Open(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
+			log.L.Info("failed to open source file %q: %w", filePath, err)
+			return nil, fmt.Errorf("failed to open source file %q: %w", filePath, err)
 		}
-		log.L.Info("Blob found in database, using cache path", "filePath", filePath)
+		defer sourcefile.Close()
+
 		fileInfo, err := sourcefile.Stat()
 		if err != nil {
-			return nil, fmt.Errorf("failed to stat source cached file: %w", err)
+			log.L.Info("failed to stat source file %q: %w", filePath, err)
+			return nil, fmt.Errorf("failed to stat source file: %w", err)
 		}
-		CopyFileRange(sourcefile, 0, targetfile, 0, fileInfo.Size())
+
+		written, err := CopyFileRange(sourcefile, 0, targetfile, 0, fileInfo.Size())
+		if err != nil {
+			log.L.Info("failed to copy file %q: %w", filePath, err)
+			targetfile.Close()
+			return nil, fmt.Errorf("failed to copy file: %w", err)
+		}
+		log.L.Info("File copied successfully",
+			"source", filePath,
+			"target", targetPath,
+			"size", written)
 	}
 
 	// If "direct" option is specified, do not cache the file on memory
