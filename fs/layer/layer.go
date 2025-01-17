@@ -216,13 +216,6 @@ func newCache(root string, cacheType string, cfg config.Config) (cache.BlobCache
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize directory cache: %w", err)
 	}
-
-	// Initialize CacheDb with the same path as cache directory
-	_, err = cache.GetCacheDB(root)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize cache database: %w", err)
-	}
-
 	return cache.NewDirectoryCache(
 		cachePath,
 		cache.DirectoryCacheConfig{

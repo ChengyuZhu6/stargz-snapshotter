@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/util/cacheutil"
 	"github.com/containerd/stargz-snapshotter/util/namedmutex"
 )
@@ -62,9 +61,6 @@ type DirectoryCacheConfig struct {
 	// Direct forcefully enables direct mode for all operation in cache.
 	// Thus operation won't use on-memory caches.
 	Direct bool
-
-	// CacheDb is the database for deduplication
-	CacheDb *CacheDb
 }
 
 // TODO: contents validation.
@@ -131,13 +127,6 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	if !filepath.IsAbs(directory) {
 		return nil, fmt.Errorf("dir cache path must be an absolute path; got %q", directory)
 	}
-
-	// Get global CacheDb instance
-	db, err := GetCacheDB(directory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get cache database: %w", err)
-	}
-
 	bufPool := config.BufPool
 	if bufPool == nil {
 		bufPool = &sync.Pool{
@@ -176,7 +165,6 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	if err := os.MkdirAll(wipdir, 0700); err != nil {
 		return nil, err
 	}
-
 	dc := &directoryCache{
 		cache:        dataCache,
 		fileCache:    fdCache,
@@ -185,7 +173,6 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 		wipDirectory: wipdir,
 		bufPool:      bufPool,
 		direct:       config.Direct,
-		db:           db,
 	}
 	dc.syncAdd = config.SyncAdd
 	return dc, nil
@@ -206,8 +193,6 @@ type directoryCache struct {
 
 	closed   bool
 	closedMu sync.Mutex
-
-	db *CacheDb
 }
 
 func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
@@ -244,70 +229,42 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		}
 	}
 
-	// Get file path from database using blob ID
-	filePath, exists, err := dc.db.GetBlobPath(key)
+	// Open the cache file and read the target region
+	// TODO: If the target cache is write-in-progress, should we wait for the completion
+	//       or simply report the cache miss?
+	file, err := os.Open(dc.cachePath(key))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get blob path from database: %w", err)
-	}
-	targetPath := dc.cachePath(key)
-
-	// Ensure target directory exists
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-		return nil, fmt.Errorf("failed to create cache directory: %w", err)
+		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
 	}
 
-	// Open or create target file with write permissions
-	targetfile, err := os.OpenFile(targetPath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open/create blob file for %q: %w", key, err)
-	}
-
-	if exists {
-		sourcefile, err := os.Open(filePath)
-		if err != nil {
-			log.L.Info("failed to open source file %q: %w", filePath, err)
-			return nil, fmt.Errorf("failed to open source file %q: %w", filePath, err)
-		}
-		defer sourcefile.Close()
-
-		fileInfo, err := sourcefile.Stat()
-		if err != nil {
-			log.L.Info("failed to stat source file %q: %w", filePath, err)
-			return nil, fmt.Errorf("failed to stat source file: %w", err)
-		}
-
-		written, err := CopyFileRange(sourcefile, 0, targetfile, 0, fileInfo.Size())
-		if err != nil {
-			log.L.Info("failed to copy file %q: %w", filePath, err)
-			targetfile.Close()
-			return nil, fmt.Errorf("failed to copy file: %w", err)
-		}
-		log.L.Info("File copied successfully",
-			"source", filePath,
-			"target", targetPath,
-			"size", written)
-	}
-
-	// If "direct" option is specified, do not cache the file on memory
+	// If "direct" option is specified, do not cache the file on memory.
+	// This option is useful for preventing memory cache from being polluted by data
+	// that won't be accessed immediately.
 	if dc.direct || opt.direct {
 		return &reader{
-			ReaderAt: targetfile,
+			ReaderAt: file,
 			closeFunc: func() error {
+				// In passthough model, close will be toke over by go-fuse
+				// If "passThrough" option is specified, "direct" option also will
+				// be specified, so adding this branch here is enough
 				if opt.passThrough {
 					return nil
 				}
-				return targetfile.Close()
+				return file.Close()
 			},
 		}, nil
 	}
 
+	// TODO: should we cache the entire file data on memory?
+	//       but making I/O (possibly huge) on every fetching
+	//       might be costly.
 	return &reader{
-		ReaderAt: targetfile,
+		ReaderAt: file,
 		closeFunc: func() error {
-			_, done, added := dc.fileCache.Add(key, targetfile)
+			_, done, added := dc.fileCache.Add(key, file)
 			defer done() // Release it immediately. Cleaned up on eviction.
 			if !added {
-				return targetfile.Close() // file already exists in the cache. close it.
+				return file.Close() // file already exists in the cache. close it.
 			}
 			return nil
 		},
@@ -319,19 +276,6 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		return nil, fmt.Errorf("cache is already closed")
 	}
 
-	// Check if blob already exists by blob ID
-	_, exists, err := dc.db.GetBlobPath(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check blob existence: %w", err)
-	} else if exists {
-		// Blob already exists, return a no-op writer
-		return &writer{
-			WriteCloser: nopWriteCloser(io.Discard),
-			commitFunc:  func() error { return nil },
-			abortFunc:   func() error { return nil },
-		}, nil
-	}
-
 	opt := &cacheOpt{}
 	for _, o := range opts {
 		opt = o(opt)
@@ -341,14 +285,12 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	w := &writer{
 		WriteCloser: wip,
 		commitFunc: func() error {
 			if dc.isClosed() {
 				return fmt.Errorf("cache is already closed")
 			}
-
 			// Commit the cache contents
 			c := dc.cachePath(key)
 			if err := os.MkdirAll(filepath.Dir(c), os.ModePerm); err != nil {
@@ -359,19 +301,7 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				errs = append(errs, fmt.Errorf("failed to create cache directory %q: %w", c, err))
 				return errors.Join(errs...)
 			}
-
-			if err := os.Rename(wip.Name(), c); err != nil {
-				return err
-			}
-
-			// Add to database
-			if _, err := dc.db.AddBlob(key, c); err != nil {
-				// If database update fails, try to remove the file
-				os.Remove(c)
-				return fmt.Errorf("failed to add blob to database: %w", err)
-			}
-
-			return nil
+			return os.Rename(wip.Name(), c)
 		},
 		abortFunc: func() error {
 			return os.Remove(wip.Name())
@@ -440,15 +370,7 @@ func (dc *directoryCache) Close() error {
 		return nil
 	}
 	dc.closed = true
-
-	var errs []error
-	if err := dc.db.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("failed to close cache database: %w", err))
-	}
-	if err := os.RemoveAll(dc.directory); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return os.RemoveAll(dc.directory)
 }
 
 func (dc *directoryCache) isClosed() bool {
