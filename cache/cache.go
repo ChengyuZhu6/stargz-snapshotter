@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/containerd/log"
+
 	"github.com/containerd/stargz-snapshotter/util/cacheutil"
 	"github.com/containerd/stargz-snapshotter/util/namedmutex"
 )
@@ -291,7 +293,7 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 	if dc.useHardLink {
 		existingPath := dc.cachePath(key)
 		if fi, err := os.Stat(existingPath); err == nil {
-			// Return a writer that skips reading from source
+			log.L.Infof("Found existing file for key %s at %s, using hard link", key, existingPath)
 			return &writer{
 				WriteCloser: &skipWriter{expectedSize: fi.Size()},
 				commitFunc:  func() error { return nil },
@@ -326,10 +328,10 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 			// If hard link is enabled and the target file exists, try to create a hard link
 			if dc.useHardLink {
 				if err := os.Link(wip.Name(), c); err == nil {
-					// Hard link created successfully
+					log.L.Infof("Created hard link from %s to %s", wip.Name(), c)
 					return os.Remove(wip.Name())
 				}
-				// If hard link fails, fall back to rename
+				log.L.Infof("Failed to create hard link, falling back to rename: %v", err)
 			}
 			return os.Rename(wip.Name(), c)
 		},

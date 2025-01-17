@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -73,6 +75,75 @@ func TestDirectoryCache(t *testing.T) {
 
 func TestMemoryCache(t *testing.T) {
 	testCache(t, "memory", func() (BlobCache, cleanFunc) { return NewMemoryCache(), func() {} })
+}
+
+func TestHardLink(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "cache-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create cache with hard link enabled
+	cache, err := NewDirectoryCache(tmpDir, DirectoryCacheConfig{
+		UseHardLink: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add first chunk
+	key := "test-key"
+	w, err := cache.Add(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("test content")
+	if _, err := w.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get file info of the first file
+	path1 := filepath.Join(tmpDir, key[:2], key)
+	fi1, err := os.Stat(path1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat1 := fi1.Sys().(*syscall.Stat_t)
+	inode1 := stat1.Ino
+
+	// Add second chunk with same key
+	w2, err := cache.Add(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get file info of the second file
+	fi2, err := os.Stat(path1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat2 := fi2.Sys().(*syscall.Stat_t)
+	inode2 := stat2.Ino
+
+	// Verify both files have same inode (are hard linked)
+	if inode1 != inode2 {
+		t.Errorf("Files are not hard linked: inode1=%d, inode2=%d", inode1, inode2)
+	}
+
+	// Verify link count is 2
+	if stat2.Nlink != 2 {
+		t.Errorf("Expected link count to be 2, got %d", stat2.Nlink)
+	}
 }
 
 type cleanFunc func()
