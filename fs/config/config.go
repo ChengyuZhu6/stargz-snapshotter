@@ -139,6 +139,9 @@ type DirectoryCacheConfig struct {
 
 	// Direct disables on-memory data cache. Default is true for saving memory usage.
 	Direct bool `toml:"direct" default:"true"`
+
+	// UseHardLink enables using hard links instead of copying when adding chunks that already exist in cache
+	UseHardLink bool `toml:"use_hard_link"`
 }
 
 // FuseConfig is configuration for FUSE fs.

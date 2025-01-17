@@ -61,6 +61,9 @@ type DirectoryCacheConfig struct {
 	// Direct forcefully enables direct mode for all operation in cache.
 	// Thus operation won't use on-memory caches.
 	Direct bool
+
+	// UseHardLink enables using hard links instead of copying when adding chunks that already exist in cache
+	UseHardLink bool `toml:"use_hard_link"`
 }
 
 // TODO: contents validation.
@@ -173,6 +176,7 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 		wipDirectory: wipdir,
 		bufPool:      bufPool,
 		direct:       config.Direct,
+		useHardLink:  config.UseHardLink,
 	}
 	dc.syncAdd = config.SyncAdd
 	return dc, nil
@@ -193,6 +197,8 @@ type directoryCache struct {
 
 	closed   bool
 	closedMu sync.Mutex
+
+	useHardLink bool
 }
 
 func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
@@ -281,16 +287,31 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		opt = o(opt)
 	}
 
+	// Check if the cache file already exists and hard link is enabled
+	if dc.useHardLink {
+		existingPath := dc.cachePath(key)
+		if fi, err := os.Stat(existingPath); err == nil {
+			// Return a writer that skips reading from source
+			return &writer{
+				WriteCloser: &skipWriter{expectedSize: fi.Size()},
+				commitFunc:  func() error { return nil },
+				abortFunc:   func() error { return nil },
+			}, nil
+		}
+	}
+
 	wip, err := dc.wipFile(key)
 	if err != nil {
 		return nil, err
 	}
+
 	w := &writer{
 		WriteCloser: wip,
 		commitFunc: func() error {
 			if dc.isClosed() {
 				return fmt.Errorf("cache is already closed")
 			}
+
 			// Commit the cache contents
 			c := dc.cachePath(key)
 			if err := os.MkdirAll(filepath.Dir(c), os.ModePerm); err != nil {
@@ -300,6 +321,15 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				}
 				errs = append(errs, fmt.Errorf("failed to create cache directory %q: %w", c, err))
 				return errors.Join(errs...)
+			}
+
+			// If hard link is enabled and the target file exists, try to create a hard link
+			if dc.useHardLink {
+				if err := os.Link(wip.Name(), c); err == nil {
+					// Hard link created successfully
+					return os.Remove(wip.Name())
+				}
+				// If hard link fails, fall back to rename
 			}
 			return os.Rename(wip.Name(), c)
 		},
@@ -462,4 +492,41 @@ func (w *writeCloser) Close() error { return w.closeFunc() }
 
 func nopWriteCloser(w io.Writer) io.WriteCloser {
 	return &writeCloser{w, func() error { return nil }}
+}
+
+// noopWriter implements io.WriteCloser but does nothing with the data
+type noopWriter struct {
+	size int64
+}
+
+func (w *noopWriter) Write(p []byte) (n int, err error) {
+	w.size += int64(len(p))
+	return len(p), nil
+}
+
+func (w *noopWriter) Close() error {
+	return nil
+}
+
+// skipWriter implements io.WriteCloser and skips reading from source
+type skipWriter struct {
+	size         int64
+	expectedSize int64
+}
+
+func (w *skipWriter) Write(p []byte) (n int, err error) {
+	remaining := w.expectedSize - w.size
+	if remaining <= 0 {
+		return 0, io.EOF
+	}
+	n = len(p)
+	if int64(n) > remaining {
+		n = int(remaining)
+	}
+	w.size += int64(n)
+	return n, nil
+}
+
+func (w *skipWriter) Close() error {
+	return nil
 }
