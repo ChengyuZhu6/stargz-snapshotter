@@ -76,6 +76,9 @@ type BlobCache interface {
 
 	// Close closes the cache
 	Close() error
+
+	// GetCachePath returns the cache path
+	GetCachePath() string
 }
 
 // Reader provides the data cached.

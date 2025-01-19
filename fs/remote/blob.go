@@ -24,8 +24,11 @@ package remote
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -78,7 +81,7 @@ type blob struct {
 
 func makeBlob(fetcher fetcher, size int64, chunkSize int64, prefetchChunkSize int64,
 	blobCache cache.BlobCache, lastCheck time.Time, checkInterval time.Duration,
-	r *Resolver, fetchTimeout time.Duration) *blob {
+	r *Resolver, fetchTimeout time.Duration) (*blob, error) {
 	return &blob{
 		fetcher:           fetcher,
 		size:              size,
@@ -89,7 +92,7 @@ func makeBlob(fetcher fetcher, size int64, chunkSize int64, prefetchChunkSize in
 		checkInterval:     checkInterval,
 		resolver:          r,
 		fetchTimeout:      fetchTimeout,
-	}
+	}, nil
 }
 
 func (b *blob) Close() error {
@@ -313,8 +316,6 @@ func (b *blob) fetchRegions(allData map[region]io.Writer, fetched map[region]boo
 		return nil
 	}
 
-	// Fetcher can be suddenly updated so we take and use the snapshot of it for
-	// consistency.
 	b.fetcherMu.Lock()
 	fr := b.fetcher
 	b.fetcherMu.Unlock()
@@ -353,35 +354,50 @@ func (b *blob) fetchRegions(allData map[region]io.Writer, fetched map[region]boo
 			return fmt.Errorf("failed to read multipart resp: %w", err)
 		}
 		if err := b.walkChunks(reg, func(chunk region) (retErr error) {
-			id := fr.genID(chunk)
-			cw, err := b.cache.Add(id, opts.cacheOpts...)
+			buffer, err := b.readChunkData(p, chunk)
 			if err != nil {
 				return err
 			}
-			defer cw.Close()
-			w := io.Writer(cw)
 
-			// If this chunk is one of the targets, write the content to the
-			// passed reader too.
-			if _, ok := fetched[chunk]; ok {
-				w = io.MultiWriter(w, allData[chunk])
-			}
+			chunkHash := b.calculateChunkHash(buffer)
+			id := fr.genID(chunk)
 
-			// Copy the target chunk
-			if _, err := io.CopyN(w, p, chunk.size()); err != nil {
-				cw.Abort()
+			existingPath, exists, err := b.resolver.chunkDB.GetChunkPath(chunkHash)
+			if err != nil {
 				return err
 			}
 
-			// Add the target chunk to the cache
-			if err := cw.Commit(); err != nil {
+			if exists {
+				targetPath := filepath.Join(b.cache.GetCachePath(), id)
+				if err := os.Link(existingPath, targetPath); err != nil {
+					return b.writeChunk(id, buffer, chunk, allData, fetched, opts)
+				}
+				
+				if err := b.resolver.chunkDB.AddChunk(chunkHash, targetPath); err != nil {
+					os.Remove(targetPath)
+					return err
+				}
+
+				if _, ok := fetched[chunk]; ok {
+					if w := allData[chunk]; w != nil {
+						if _, err := w.Write(buffer); err != nil {
+							return err
+						}
+					}
+				}
+				fetched[chunk] = true
+				return nil
+			}
+
+			if err := b.writeChunk(id, buffer, chunk, allData, fetched, opts); err != nil {
 				return err
 			}
 
-			b.fetchedRegionSetMu.Lock()
-			b.fetchedRegionSet.add(chunk)
-			b.fetchedRegionSetMu.Unlock()
-			fetched[chunk] = true
+			cachePath := filepath.Join(b.cache.GetCachePath(), id)
+			if err := b.resolver.chunkDB.AddChunk(chunkHash, cachePath); err != nil {
+				return err
+			}
+
 			return nil
 		}); err != nil {
 			return fmt.Errorf("failed to get chunks: %w", err)
@@ -532,4 +548,49 @@ func positive(n int64) int64 {
 		return 0
 	}
 	return n
+}
+
+// 添加新的函数来计算chunk的hash
+func (b *blob) calculateChunkHash(chunk []byte) string {
+	h := sha256.New()
+	h.Write(chunk)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// 辅助函数：写入chunk数据
+func (b *blob) writeChunk(id string, data []byte, chunk region, allData map[region]io.Writer, fetched map[region]bool, opts *options) error {
+	cw, err := b.cache.Add(id, opts.cacheOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to create cache writer: %w", err)
+	}
+	defer cw.Close()
+	
+	w := io.Writer(cw)
+	if _, ok := fetched[chunk]; ok {
+		w = io.MultiWriter(w, allData[chunk])
+	}
+
+	if _, err := w.Write(data); err != nil {
+		cw.Abort()
+		return fmt.Errorf("failed to write chunk data: %w", err)
+	}
+
+	if err := cw.Commit(); err != nil {
+		return fmt.Errorf("failed to commit chunk: %w", err)
+	}
+
+	b.fetchedRegionSetMu.Lock()
+	b.fetchedRegionSet.add(chunk)
+	b.fetchedRegionSetMu.Unlock()
+	fetched[chunk] = true
+	
+	return nil
+}
+
+func (b *blob) readChunkData(p io.Reader, chunk region) ([]byte, error) {
+	buffer := make([]byte, chunk.size())
+	if _, err := io.ReadFull(p, buffer); err != nil {
+		return nil, fmt.Errorf("failed to read chunk data: %w", err)
+	}
+	return buffer, nil
 }
