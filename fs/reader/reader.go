@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"sync"
@@ -625,22 +626,35 @@ func (gr *reader) verifyOneChunk(entryID uint32, ip []byte, chunkDigestStr strin
 	return nil
 }
 
-func (gr *reader) cacheData(ip []byte, cacheID string) {
-	if w, err := gr.cache.Add(cacheID); err == nil {
-		if cn, err := w.Write(ip); err != nil || cn != len(ip) {
-			w.Abort()
-		} else {
-			w.Commit()
-		}
-		w.Close()
-	}
-}
-
 func (gr *reader) verifyAndCache(entryID uint32, ip []byte, chunkDigestStr string, cacheID string) error {
 	if err := gr.verifyOneChunk(entryID, ip, chunkDigestStr); err != nil {
 		return err
 	}
-	gr.cacheData(ip, cacheID)
+
+	// Check hardlink if supported
+	if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
+		if hl.HasHardlink(cacheID) {
+			return nil
+		}
+	}
+
+	// Write to cache
+	if w, err := gr.cache.Add(cacheID); err == nil {
+		if cn, err := w.Write(ip); err != nil || cn != len(ip) {
+			w.Abort()
+		} else {
+			if err := w.Commit(); err == nil {
+				// Create hardlink if supported
+				if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
+					if err := hl.CreateHardlink(cacheID); err != nil {
+						// Log error but continue
+						log.Printf("Failed to create hardlink: %v", err)
+					}
+				}
+			}
+		}
+		w.Close()
+	}
 	return nil
 }
 
@@ -706,4 +720,9 @@ func digestVerifier(id uint32, chunkDigestStr string) (digest.Verifier, error) {
 		return nil, fmt.Errorf("invalid chunk: no digest is recorded(len=%d): %w", len(chunkDigestStr), err)
 	}
 	return chunkDigest.Verifier(), nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
 }

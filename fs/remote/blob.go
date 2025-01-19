@@ -26,6 +26,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -120,7 +122,7 @@ func (b *blob) Refresh(ctx context.Context, hosts source.RegistryHosts, refspec 
 		return err
 	}
 	if newSize != b.size {
-		return fmt.Errorf("Invalid size of new blob %d; want %d", newSize, b.size)
+		return fmt.Errorf("invalid size of new blob %d; want %d", newSize, b.size)
 	}
 
 	// update the blob's fetcher with new one
@@ -187,6 +189,13 @@ func makeSyncKey(allData map[region]io.Writer) string {
 func (b *blob) cacheAt(offset int64, size int64, fr fetcher, cacheOpts *options) error {
 	fetchReg := region{floor(offset, b.chunkSize), ceil(offset+size-1, b.chunkSize) - 1}
 	discard := make(map[region]io.Writer)
+
+	// Check hardlink if supported
+	if hl, ok := b.cache.(cache.HardlinkCapability); ok {
+		if hl.HasHardlink(fr.genID(fetchReg)) {
+			return nil
+		}
+	}
 
 	err := b.walkChunks(fetchReg, func(reg region) error {
 		if r, err := b.cache.Get(fr.genID(reg), cacheOpts.cacheOpts...); err == nil {
@@ -547,10 +556,23 @@ func (b *blob) cacheChunkData(chunk region, r io.Reader, fr fetcher, allData map
 		return fmt.Errorf("failed to commit chunk: %w", err)
 	}
 
+	// Create hardlink if supported
+	if hl, ok := b.cache.(cache.HardlinkCapability); ok {
+		if err := hl.CreateHardlink(id); err != nil {
+			// Log error but continue
+			log.Printf("Failed to create hardlink: %v", err)
+		}
+	}
+
 	b.fetchedRegionSetMu.Lock()
 	b.fetchedRegionSet.add(chunk)
 	b.fetchedRegionSetMu.Unlock()
 	fetched[chunk] = true
 
 	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
 }

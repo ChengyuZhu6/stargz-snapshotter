@@ -31,6 +31,9 @@ const (
 	// the layer. If the layer is eStargz and contains prefetch landmarks, these config
 	// will be respeced.
 	TargetPrefetchSizeLabel = "containerd.io/snapshot/remote/stargz.prefetch"
+
+	defaultMaxLRUCacheEntry = 10
+	defaultMaxCacheFds      = 10
 )
 
 // Config is configuration for stargz snapshotter filesystem.
@@ -139,6 +142,9 @@ type DirectoryCacheConfig struct {
 
 	// Direct disables on-memory data cache. Default is true for saving memory usage.
 	Direct bool `toml:"direct" default:"true"`
+
+	// EnableHardlink enables hardlinking of cache files to reduce memory usage. Default is false.
+	EnableHardlink bool `toml:"enable_hardlink"`
 }
 
 // FuseConfig is configuration for FUSE fs.

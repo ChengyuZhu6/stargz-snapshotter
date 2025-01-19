@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -61,6 +62,9 @@ type DirectoryCacheConfig struct {
 	// Direct forcefully enables direct mode for all operation in cache.
 	// Thus operation won't use on-memory caches.
 	Direct bool
+
+	// EnableHardlink enables hardlinking of cache files to reduce memory usage
+	EnableHardlink bool
 }
 
 // TODO: contents validation.
@@ -166,15 +170,25 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 		return nil, err
 	}
 	dc := &directoryCache{
-		cache:        dataCache,
-		fileCache:    fdCache,
-		wipLock:      new(namedmutex.NamedMutex),
-		directory:    directory,
-		wipDirectory: wipdir,
-		bufPool:      bufPool,
-		direct:       config.Direct,
+		cache:          dataCache,
+		fileCache:      fdCache,
+		wipLock:        new(namedmutex.NamedMutex),
+		directory:      directory,
+		wipDirectory:   wipdir,
+		bufPool:        bufPool,
+		direct:         config.Direct,
+		enableHardlink: config.EnableHardlink,
 	}
 	dc.syncAdd = config.SyncAdd
+
+	if config.EnableHardlink {
+		hlManager, err := NewHardlinkManager(directory)
+		if err != nil {
+			return nil, err
+		}
+		dc.hlManager = hlManager
+	}
+
 	return dc, nil
 }
 
@@ -193,6 +207,10 @@ type directoryCache struct {
 
 	closed   bool
 	closedMu sync.Mutex
+
+	enableHardlink bool
+
+	hlManager *HardlinkManager
 }
 
 func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
@@ -205,8 +223,21 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		opt = o(opt)
 	}
 
+	// 1. Try to get from hardlink first
+	if dc.hlManager != nil {
+		if linkPath, exists := dc.hlManager.GetLink(key); exists {
+			if r, err := os.Open(linkPath); err == nil {
+				return &reader{
+					ReaderAt:  r,
+					closeFunc: r.Close,
+				}, nil
+			}
+			// If failed to open, continue with normal flow
+		}
+	}
+
+	// 2. Try to get from memory cache
 	if !dc.direct && !opt.direct {
-		// Get data from memory
 		if b, done, ok := dc.cache.Get(key); ok {
 			return &reader{
 				ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
@@ -217,36 +248,29 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 			}, nil
 		}
 
-		// Get data from disk. If the file is already opened, use it.
+		// Try to get from file descriptor cache
 		if f, done, ok := dc.fileCache.Get(key); ok {
 			return &reader{
 				ReaderAt: f.(*os.File),
 				closeFunc: func() error {
-					done() // file will be closed when it's evicted from the cache
+					done()
 					return nil
 				},
 			}, nil
 		}
 	}
 
-	// Open the cache file and read the target region
-	// TODO: If the target cache is write-in-progress, should we wait for the completion
-	//       or simply report the cache miss?
+	// 3. Read from disk
 	file, err := os.Open(dc.cachePath(key))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
 	}
 
-	// If "direct" option is specified, do not cache the file on memory.
-	// This option is useful for preventing memory cache from being polluted by data
-	// that won't be accessed immediately.
+	// 4. If in direct mode, don't cache file descriptor
 	if dc.direct || opt.direct {
 		return &reader{
 			ReaderAt: file,
 			closeFunc: func() error {
-				// In passthough model, close will be toke over by go-fuse
-				// If "passThrough" option is specified, "direct" option also will
-				// be specified, so adding this branch here is enough
 				if opt.passThrough {
 					return nil
 				}
@@ -255,16 +279,14 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		}, nil
 	}
 
-	// TODO: should we cache the entire file data on memory?
-	//       but making I/O (possibly huge) on every fetching
-	//       might be costly.
+	// 5. Cache file descriptor
 	return &reader{
 		ReaderAt: file,
 		closeFunc: func() error {
 			_, done, added := dc.fileCache.Add(key, file)
-			defer done() // Release it immediately. Cleaned up on eviction.
+			defer done()
 			if !added {
-				return file.Close() // file already exists in the cache. close it.
+				return file.Close()
 			}
 			return nil
 		},
@@ -276,60 +298,77 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		return nil, fmt.Errorf("cache is already closed")
 	}
 
-	opt := &cacheOpt{}
-	for _, o := range opts {
-		opt = o(opt)
-	}
-
-	wip, err := dc.wipFile(key)
+	// 1. Create temporary file
+	w, err := dc.wipFile(key)
 	if err != nil {
 		return nil, err
 	}
-	w := &writer{
-		WriteCloser: wip,
+
+	// 2. Create writer
+	writer := &writer{
+		WriteCloser: w,
 		commitFunc: func() error {
 			if dc.isClosed() {
 				return fmt.Errorf("cache is already closed")
 			}
-			// Commit the cache contents
-			c := dc.cachePath(key)
-			if err := os.MkdirAll(filepath.Dir(c), os.ModePerm); err != nil {
-				var errs []error
-				if err := os.Remove(wip.Name()); err != nil {
-					errs = append(errs, err)
-				}
-				errs = append(errs, fmt.Errorf("failed to create cache directory %q: %w", c, err))
-				return errors.Join(errs...)
+
+			// Commit file
+			targetPath := dc.cachePath(key)
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+				return fmt.Errorf("failed to create cache directory: %w", err)
 			}
-			return os.Rename(wip.Name(), c)
+
+			if err := os.Rename(w.Name(), targetPath); err != nil {
+				return fmt.Errorf("failed to commit cache file: %w", err)
+			}
+
+			// Create hardlink
+			if dc.hlManager != nil {
+				if err := dc.hlManager.CreateLink(key, targetPath); err != nil {
+					// Log error but don't affect main flow
+					log.Printf("Failed to create hardlink: %v", err)
+				}
+			}
+
+			return nil
 		},
 		abortFunc: func() error {
-			return os.Remove(wip.Name())
+			return os.Remove(w.Name())
 		},
 	}
 
-	// If "direct" option is specified, do not cache the passed data on memory.
-	// This option is useful for preventing memory cache from being polluted by data
-	// that won't be accessed immediately.
+	// 3. Return directly if in direct mode
+	opt := &cacheOpt{}
+	for _, o := range opts {
+		opt = o(opt)
+	}
 	if dc.direct || opt.direct {
-		return w, nil
+		return writer, nil
 	}
 
+	// 4. Create memory cache
 	b := dc.bufPool.Get().(*bytes.Buffer)
-	memW := &writer{
-		WriteCloser: nopWriteCloser(io.Writer(b)),
+	return dc.wrapMemoryWriter(b, writer, key)
+}
+
+func (dc *directoryCache) wrapMemoryWriter(b *bytes.Buffer, w *writer, key string) (Writer, error) {
+	return &writer{
+		WriteCloser: nopWriteCloser(b),
 		commitFunc: func() error {
 			if dc.isClosed() {
 				w.Close()
 				return fmt.Errorf("cache is already closed")
 			}
+
 			cached, done, added := dc.cache.Add(key, b)
 			if !added {
-				dc.putBuffer(b) // already exists in the cache. abort it.
+				dc.putBuffer(b)
 			}
+
 			commit := func() error {
 				defer done()
 				defer w.Close()
+
 				n, err := w.Write(cached.(*bytes.Buffer).Bytes())
 				if err != nil || n != cached.(*bytes.Buffer).Len() {
 					w.Abort()
@@ -337,12 +376,14 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				}
 				return w.Commit()
 			}
+
 			if dc.syncAdd {
 				return commit()
 			}
+
 			go func() {
 				if err := commit(); err != nil {
-					fmt.Println("failed to commit to file:", err)
+					log.Printf("failed to commit to file: %v", err)
 				}
 			}()
 			return nil
@@ -350,12 +391,10 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		abortFunc: func() error {
 			defer w.Close()
 			defer w.Abort()
-			dc.putBuffer(b) // abort it.
+			dc.putBuffer(b)
 			return nil
 		},
-	}
-
-	return memW, nil
+	}, nil
 }
 
 func (dc *directoryCache) putBuffer(b *bytes.Buffer) {
@@ -366,11 +405,24 @@ func (dc *directoryCache) putBuffer(b *bytes.Buffer) {
 func (dc *directoryCache) Close() error {
 	dc.closedMu.Lock()
 	defer dc.closedMu.Unlock()
+
 	if dc.closed {
 		return nil
 	}
 	dc.closed = true
-	return os.RemoveAll(dc.directory)
+
+	var errs []error
+	if dc.hlManager != nil {
+		if err := dc.hlManager.cleanup(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if err := os.RemoveAll(dc.directory); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
 }
 
 func (dc *directoryCache) isClosed() bool {
@@ -405,7 +457,7 @@ func (mc *MemoryCache) Get(key string, opts ...Option) (Reader, error) {
 	defer mc.mu.Unlock()
 	b, ok := mc.Membuf[key]
 	if !ok {
-		return nil, fmt.Errorf("Missed cache: %q", key)
+		return nil, fmt.Errorf("missed cache: %q", key)
 	}
 	return &reader{bytes.NewReader(b.Bytes()), func() error { return nil }}, nil
 }
@@ -462,4 +514,27 @@ func (w *writeCloser) Close() error { return w.closeFunc() }
 
 func nopWriteCloser(w io.Writer) io.WriteCloser {
 	return &writeCloser{w, func() error { return nil }}
+}
+
+// HardlinkCapability represents a cache that supports hardlinking
+type HardlinkCapability interface {
+	// CreateHardlink creates a hardlink for the cached file
+	CreateHardlink(key string) error
+	// HasHardlink checks if a hardlink exists for the given key
+	HasHardlink(key string) bool
+}
+
+func (dc *directoryCache) CreateHardlink(key string) error {
+	if !dc.enableHardlink || dc.hlManager == nil {
+		return nil
+	}
+	return dc.hlManager.CreateLink(key, dc.cachePath(key))
+}
+
+func (dc *directoryCache) HasHardlink(key string) bool {
+	if !dc.enableHardlink || dc.hlManager == nil {
+		return false
+	}
+	_, exists := dc.hlManager.GetLink(key)
+	return exists
 }
