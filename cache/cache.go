@@ -333,11 +333,11 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				return fmt.Errorf("failed to commit cache file: %w", err)
 			}
 
-			// Create hardlink
+			// Create hardlink after file is committed
 			if dc.hlManager != nil {
-				if err := dc.hlManager.CreateLink(key, targetPath); err != nil {
+				if err := dc.CreateHardlink(key); err != nil {
 					// Log error but don't affect main flow
-					log.L.Infof("Failed to create hardlink: %v", err)
+					log.L.Debugf("Failed to create hardlink: %v", err)
 				}
 			}
 
