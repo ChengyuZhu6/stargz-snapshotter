@@ -525,8 +525,14 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 	}))
 	commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.PrefetchDecompress, decompressStart) // time to decompress prefetch data
 	if err != nil {
+		log.G(ctx).WithError(err).WithField("digest", l.desc.Digest).
+			Warn("failed to cache prefetched layer")
 		return fmt.Errorf("failed to cache prefetched layer: %w", err)
 	}
+
+	log.G(ctx).WithField("digest", l.desc.Digest).
+		WithField("prefetchSize", prefetchSize).
+		Debug("completed prefetch with hardlink enabled")
 
 	return nil
 }

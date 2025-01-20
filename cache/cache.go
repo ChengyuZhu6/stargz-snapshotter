@@ -21,11 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/util/cacheutil"
 	"github.com/containerd/stargz-snapshotter/util/namedmutex"
 )
@@ -131,6 +131,14 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	if !filepath.IsAbs(directory) {
 		return nil, fmt.Errorf("dir cache path must be an absolute path; got %q", directory)
 	}
+
+	// Log hardlink configuration
+	if config.EnableHardlink {
+		log.L.Infof("Hardlink feature is enabled for cache directory: %q", directory)
+	} else {
+		log.L.Infof("Hardlink feature is disabled for cache directory: %q", directory)
+	}
+
 	bufPool := config.BufPool
 	if bufPool == nil {
 		bufPool = &sync.Pool{
@@ -186,6 +194,7 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 		if err != nil {
 			return nil, err
 		}
+		log.L.Infof("Initialized hardlink manager for cache directory: %q", directory)
 		dc.hlManager = hlManager
 	}
 
@@ -326,7 +335,7 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 			if dc.hlManager != nil {
 				if err := dc.hlManager.CreateLink(key, targetPath); err != nil {
 					// Log error but don't affect main flow
-					log.Printf("Failed to create hardlink: %v", err)
+					log.L.Infof("Failed to create hardlink: %v", err)
 				}
 			}
 
@@ -383,7 +392,7 @@ func (dc *directoryCache) wrapMemoryWriter(b *bytes.Buffer, w *writer, key strin
 
 			go func() {
 				if err := commit(); err != nil {
-					log.Printf("failed to commit to file: %v", err)
+					log.L.Infof("failed to commit to file: %v", err)
 				}
 			}()
 			return nil
@@ -526,15 +535,22 @@ type HardlinkCapability interface {
 
 func (dc *directoryCache) CreateHardlink(key string) error {
 	if !dc.enableHardlink || dc.hlManager == nil {
+		log.L.Infof("Hardlink creation skipped for key %q: feature not enabled", key)
 		return nil
 	}
+	log.L.Infof("Creating hardlink for key %q", key)
 	return dc.hlManager.CreateLink(key, dc.cachePath(key))
 }
 
 func (dc *directoryCache) HasHardlink(key string) bool {
 	if !dc.enableHardlink || dc.hlManager == nil {
+		log.L.Infof("Hardlink check skipped for key %q: feature not enabled", key)
 		return false
 	}
-	_, exists := dc.hlManager.GetLink(key)
-	return exists
+	if _, exists := dc.hlManager.GetLink(key); exists {
+		log.L.Infof("Found existing hardlink for key %q", key)
+		return true
+	}
+	log.L.Infof("No hardlink found for key %q", key)
+	return false
 }
