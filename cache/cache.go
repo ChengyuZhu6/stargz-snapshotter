@@ -190,11 +190,13 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	dc.syncAdd = config.SyncAdd
 
 	if config.EnableHardlink {
-		hlManager, err := NewHardlinkManager(directory)
+		// Get root directory for hardlink manager (../../)
+		rootDir := filepath.Dir(filepath.Dir(directory))
+		hlManager, err := GetGlobalHardlinkManager(rootDir)
 		if err != nil {
 			return nil, err
 		}
-		log.L.Infof("Initialized hardlink manager for cache directory: %q", directory)
+		log.L.Infof("Using global hardlink manager with root directory: %q", rootDir)
 		dc.hlManager = hlManager
 	}
 

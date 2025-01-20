@@ -16,9 +16,16 @@ const (
 	linksFileName   = "links.json"
 )
 
+var (
+	globalHLManager *HardlinkManager
+	hlManagerOnce   sync.Once
+	hlManagerMu     sync.RWMutex
+)
+
 // HardlinkManager manages creation, recovery and cleanup of hardlinks
 type HardlinkManager struct {
 	root            string
+	hlDir           string
 	mu              sync.RWMutex
 	links           map[string]*linkInfo
 	cleanupInterval time.Duration
@@ -32,19 +39,21 @@ type linkInfo struct {
 }
 
 // NewHardlinkManager creates a new hardlink manager
-func NewHardlinkManager(cacheRoot string) (*HardlinkManager, error) {
-	hlDir := filepath.Join(cacheRoot, hardlinkDirName)
+func NewHardlinkManager(root string) (*HardlinkManager, error) {
+	// Create hardlinks directory under root
+	hlDir := filepath.Join(root, hardlinkDirName)
 	if err := os.MkdirAll(hlDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create hardlink dir: %w", err)
 	}
 
 	hm := &HardlinkManager{
-		root:            hlDir,
+		root:            root,  // Store root directory
+		hlDir:           hlDir, // Store hardlinks directory
 		links:           make(map[string]*linkInfo),
 		cleanupInterval: 24 * time.Hour,
 	}
 
-	// Restore persisted hardlink information
+	// Restore persisted hardlink information from root directory
 	if err := hm.restore(); err != nil {
 		return nil, err
 	}
@@ -53,6 +62,30 @@ func NewHardlinkManager(cacheRoot string) (*HardlinkManager, error) {
 	go hm.periodicCleanup()
 
 	return hm, nil
+}
+
+// GetGlobalHardlinkManager returns the global hardlink manager instance
+func GetGlobalHardlinkManager(root string) (*HardlinkManager, error) {
+	hlManagerMu.RLock()
+	if globalHLManager != nil {
+		defer hlManagerMu.RUnlock()
+		return globalHLManager, nil
+	}
+	hlManagerMu.RUnlock()
+
+	hlManagerMu.Lock()
+	defer hlManagerMu.Unlock()
+
+	var initErr error
+	hlManagerOnce.Do(func() {
+		globalHLManager, initErr = NewHardlinkManager(root)
+	})
+
+	if initErr != nil {
+		return nil, fmt.Errorf("failed to initialize global hardlink manager: %w", initErr)
+	}
+
+	return globalHLManager, nil
 }
 
 // CreateLink creates a hardlink
@@ -66,8 +99,8 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
 		return fmt.Errorf("failed to stat source file: %w", err)
 	}
 
-	// Create hardlink directory
-	linkPath := filepath.Join(hm.root, key[:2], key)
+	// Create hardlink in hardlinks directory
+	linkPath := filepath.Join(hm.hlDir, key[:2], key)
 	if err := os.MkdirAll(filepath.Dir(linkPath), 0700); err != nil {
 		log.L.Infof("Failed to create hardlink directory for key %q: %v", key, err)
 		return fmt.Errorf("failed to create link dir: %w", err)
@@ -157,7 +190,7 @@ func (hm *HardlinkManager) periodicCleanup() {
 	}
 }
 
-// persist persists link information
+// persist persists link information to root directory
 func (hm *HardlinkManager) persist() error {
 	f, err := os.Create(filepath.Join(hm.root, linksFileName))
 	if err != nil {
@@ -168,7 +201,7 @@ func (hm *HardlinkManager) persist() error {
 	return json.NewEncoder(f).Encode(hm.links)
 }
 
-// restore restores link information
+// restore restores link information from root directory
 func (hm *HardlinkManager) restore() error {
 	f, err := os.Open(filepath.Join(hm.root, linksFileName))
 	if err != nil {
