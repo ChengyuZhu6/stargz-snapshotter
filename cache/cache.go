@@ -537,22 +537,22 @@ type HardlinkCapability interface {
 
 func (dc *directoryCache) CreateHardlink(key string) error {
 	if !dc.enableHardlink || dc.hlManager == nil {
-		log.L.Infof("Hardlink creation skipped for key %q: feature not enabled", key)
+		log.L.Debugf("Hardlink creation skipped for key %q: feature not enabled", key)
 		return nil
 	}
-	log.L.Infof("Creating hardlink for key %q", key)
+	log.L.Debugf("Creating hardlink for key %q", key)
 	return dc.hlManager.CreateLink(key, dc.cachePath(key))
 }
 
 func (dc *directoryCache) HasHardlink(key string) bool {
 	if !dc.enableHardlink || dc.hlManager == nil {
-		log.L.Infof("Hardlink check skipped for key %q: feature not enabled", key)
+		log.L.Debugf("Hardlink check skipped for key %q: feature not enabled", key)
 		return false
 	}
 	if _, exists := dc.hlManager.GetLink(key); exists {
-		log.L.Infof("Found existing hardlink for key %q", key)
+		log.L.Debugf("Found existing hardlink for key %q", key)
 		return true
 	}
-	log.L.Infof("No hardlink found for key %q", key)
+	log.L.Debugf("No hardlink found for key %q", key)
 	return false
 }
