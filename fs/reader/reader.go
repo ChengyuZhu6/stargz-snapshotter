@@ -454,8 +454,6 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 		}
 
 		// We missed cache. Take it from underlying reader.
-		// We read the whole chunk here and add it to the cache so that following
-		// reads against neighboring chunks can take the data without decmpression.
 		if lowerDiscard == 0 && upperDiscard == 0 {
 			// We can directly store the result to the given buffer
 			ip := p[nr : int64(nr)+chunkSize]
@@ -463,9 +461,12 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			if err != nil && err != io.EOF {
 				return 0, fmt.Errorf("failed to read data: %w", err)
 			}
-			if err := sf.gr.verifyAndCache(sf.id, ip, chunkDigestStr, id); err != nil {
+
+			// First verify then cache
+			if err := sf.gr.verifyAndCache(sf.id, ip[:n], chunkDigestStr, id); err != nil {
 				return 0, err
 			}
+
 			nr += n
 			continue
 		}
@@ -597,16 +598,21 @@ func (sf *file) prefetchEntireFile(entireCacheID string) error {
 			w.Abort()
 			return fmt.Errorf("failed to read data: %w", err)
 		}
+
+		// First verify the chunk
 		if err := sf.gr.verifyOneChunk(sf.id, ip, chunkDigestStr); err != nil {
 			sf.gr.putBuffer(b)
 			w.Abort()
 			return err
 		}
+
+		// Then write to cache
 		if _, err := w.Write(ip); err != nil {
 			sf.gr.putBuffer(b)
 			w.Abort()
 			return fmt.Errorf("failed to write fetched data: %w", err)
 		}
+
 		totalSize += chunkSize
 		offset = chunkOffset + chunkSize
 		sf.gr.putBuffer(b)
@@ -627,34 +633,46 @@ func (gr *reader) verifyOneChunk(entryID uint32, ip []byte, chunkDigestStr strin
 }
 
 func (gr *reader) verifyAndCache(entryID uint32, ip []byte, chunkDigestStr string, cacheID string) error {
+	// First verify the chunk
 	if err := gr.verifyOneChunk(entryID, ip, chunkDigestStr); err != nil {
 		return err
 	}
 
-	// Check hardlink if supported
-	if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
-		if hl.HasHardlink(cacheID) {
-			return nil
-		}
+	// Check if we already have this chunk cached
+	if r, err := gr.cache.Get(cacheID); err == nil {
+		r.Close()
+		return nil
 	}
 
 	// Write to cache
-	if w, err := gr.cache.Add(cacheID); err == nil {
-		if cn, err := w.Write(ip); err != nil || cn != len(ip) {
-			w.Abort()
-		} else {
-			if err := w.Commit(); err == nil {
-				// Create hardlink if supported
-				if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
-					if err := hl.CreateHardlink(cacheID); err != nil {
-						// Log error but continue
-						log.Printf("Failed to create hardlink: %v", err)
-					}
-				}
+	w, err := gr.cache.Add(cacheID)
+	if err != nil {
+		return fmt.Errorf("failed to create cache writer: %w", err)
+	}
+	defer w.Close()
+
+	// Write the data
+	if n, err := w.Write(ip); err != nil || n != len(ip) {
+		w.Abort()
+		return fmt.Errorf("failed to write to cache: %w", err)
+	}
+
+	// Commit the write
+	if err := w.Commit(); err != nil {
+		return fmt.Errorf("failed to commit to cache: %w", err)
+	}
+
+	// After successful write and commit, try to create hardlink
+	if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
+		// First check if a hardlink already exists
+		if !hl.HasHardlink(cacheID) {
+			if err := hl.CreateHardlink(cacheID); err != nil {
+				// Log error but continue
+				log.Printf("Failed to create hardlink for %q: %v", cacheID, err)
 			}
 		}
-		w.Close()
 	}
+
 	return nil
 }
 
