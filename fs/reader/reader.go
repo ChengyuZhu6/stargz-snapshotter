@@ -641,7 +641,12 @@ func (gr *reader) verifyAndCache(entryID uint32, ip []byte, chunkDigestStr strin
 	// Check if we already have this chunk cached
 	if r, err := gr.cache.Get(cacheID); err == nil {
 		r.Close()
-		return nil
+		// Verify existing cache entry
+		if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
+			if hl.HasHardlink(cacheID) {
+				return nil
+			}
+		}
 	}
 
 	// Write to cache
@@ -662,14 +667,18 @@ func (gr *reader) verifyAndCache(entryID uint32, ip []byte, chunkDigestStr strin
 		return fmt.Errorf("failed to commit to cache: %w", err)
 	}
 
-	// After successful write and commit, try to create hardlink
+	// Create hardlink after successful commit
 	if hl, ok := gr.cache.(cache.HardlinkCapability); ok {
-		// First check if a hardlink already exists
-		if !hl.HasHardlink(cacheID) {
+		for retries := 0; retries < 3; retries++ {
 			if err := hl.CreateHardlink(cacheID); err != nil {
-				// Log error but continue
-				log.Printf("Failed to create hardlink for %q: %v", cacheID, err)
+				if retries == 2 {
+					// Log error on final retry
+					log.Printf("Failed to create hardlink for %q after %d retries: %v", cacheID, retries+1, err)
+				}
+				time.Sleep(10 * time.Millisecond)
+				continue
 			}
+			break
 		}
 	}
 

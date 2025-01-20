@@ -23,6 +23,13 @@ var (
 	hlManagerMu     sync.RWMutex
 )
 
+type linkInfo struct {
+	SourcePath string    `json:"source"`
+	LinkPath   string    `json:"link"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastUsed   time.Time `json:"last_used"`
+}
+
 // HardlinkManager manages creation, recovery and cleanup of hardlinks
 type HardlinkManager struct {
 	root            string
@@ -30,13 +37,6 @@ type HardlinkManager struct {
 	mu              sync.RWMutex
 	links           map[string]*linkInfo
 	cleanupInterval time.Duration
-}
-
-type linkInfo struct {
-	SourcePath string    `json:"source"`
-	LinkPath   string    `json:"link"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastUsed   time.Time `json:"last_used"`
 }
 
 // NewHardlinkManager creates a new hardlink manager
@@ -98,59 +98,52 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
 	sourceInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		log.L.Debugf("Source file stat failed %q: %v", sourcePath, err)
-	} else {
-		log.L.Debugf("Source file %q exists, size: %d", sourcePath, sourceInfo.Size())
-	}
-
-	// Check source file exists and wait for it to be fully written
-	var sourceErr error
-	for retries := 0; retries < 3; retries++ {
-		if _, err := os.Stat(sourcePath); err != nil {
-			sourceErr = err
-			// Wait a bit and retry
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		sourceErr = nil
-		break
-	}
-	if sourceErr != nil {
-		log.L.Debugf("Failed to create hardlink: source file %q does not exist: %v", sourcePath, sourceErr)
-		return fmt.Errorf("failed to stat source file: %w", sourceErr)
+		return fmt.Errorf("failed to stat source file: %w", err)
 	}
 
 	// Create hardlink in hardlinks directory
 	linkPath := filepath.Join(hm.hlDir, key[:2], key)
 	if err := os.MkdirAll(filepath.Dir(linkPath), 0700); err != nil {
-		log.L.Debugf("Failed to create hardlink directory for key %q: %v", key, err)
 		return fmt.Errorf("failed to create link dir: %w", err)
 	}
 
-	// Create hardlink
-	if err := os.Link(sourcePath, linkPath); err != nil {
-		if !os.IsExist(err) {
-			log.L.Debugf("Failed to create hardlink from %q to %q: %v", sourcePath, linkPath, err)
-			return fmt.Errorf("failed to create hardlink: %w", err)
-		}
-		// Add inode check for existing link
-		srcStat, _ := os.Stat(sourcePath)
-		linkStat, _ := os.Stat(linkPath)
-		if os.SameFile(srcStat, linkStat) {
-			log.L.Debugf("Verified hardlink exists with same inode for %q", key)
-		} else {
-			log.L.Warnf("Files exist but are not hardlinked for key %q", key)
-		}
-		log.L.Debugf("Hardlink already exists from %q to %q", sourcePath, linkPath)
-	} else {
-		// Verify the hardlink was created successfully
-		srcStat, _ := os.Stat(sourcePath)
-		linkStat, _ := os.Stat(linkPath)
-		if os.SameFile(srcStat, linkStat) {
-			log.L.Debugf("Successfully created and verified hardlink from %q to %q (inode: %v)",
-				sourcePath, linkPath, srcStat.Sys().(*syscall.Stat_t).Ino)
-		} else {
-			log.L.Warnf("Failed to verify hardlink - files have different inodes")
-		}
+	// Create temporary link path
+	tmpLinkPath := linkPath + ".tmp"
+
+	// Remove temporary link if it exists
+	os.Remove(tmpLinkPath)
+
+	// Create hardlink using temporary path
+	if err := os.Link(sourcePath, tmpLinkPath); err != nil {
+		return fmt.Errorf("failed to create temporary hardlink: %w", err)
+	}
+
+	// Verify the temporary link
+	tmpInfo, err := os.Stat(tmpLinkPath)
+	if err != nil {
+		os.Remove(tmpLinkPath)
+		return fmt.Errorf("failed to stat temporary link: %w", err)
+	}
+
+	if !os.SameFile(sourceInfo, tmpInfo) {
+		os.Remove(tmpLinkPath)
+		return fmt.Errorf("temporary link verification failed - different inodes")
+	}
+
+	// Atomically rename temporary link to final location
+	if err := os.Rename(tmpLinkPath, linkPath); err != nil {
+		os.Remove(tmpLinkPath)
+		return fmt.Errorf("failed to rename temporary link: %w", err)
+	}
+
+	// Final verification
+	finalInfo, err := os.Stat(linkPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat final link: %w", err)
+	}
+
+	if !os.SameFile(sourceInfo, finalInfo) {
+		return fmt.Errorf("final link verification failed - different inodes")
 	}
 
 	// Record link info
