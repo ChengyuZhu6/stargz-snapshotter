@@ -597,13 +597,11 @@ func (l *layer) RootNode(baseInode uint32) (fusefs.InodeEmbedder, error) {
 
 func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, error) {
 	if l.dedupManager != nil {
-		// Check if layer is still valid
 		if l.isClosed() {
 			return 0, fmt.Errorf("layer is closed")
 		}
 
 		chunkSize := l.dedupManager.GetChunkSize()
-		// 按块大小对齐读取
 		alignedOffset := (offset / chunkSize) * chunkSize
 		readSize := chunkSize
 		if alignedOffset+chunkSize > l.blob.Size() {
@@ -611,40 +609,40 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 		}
 		chunk := make([]byte, readSize)
 
-		// 先检查是否有重复块
-		hash := l.dedupManager.ChunkHash(chunk)
-		if cached, err := l.dedupManager.GetChunkCache().Get(hash); err == nil {
-			if cached == nil {
-				return 0, fmt.Errorf("invalid cache entry")
-			}
-			n, err := cached.ReadAt(chunk, 0)
-			if err != nil {
-				return 0, err
-			}
-			// 只复制请求的部分
-			start := offset - alignedOffset
-			if start < int64(n) {
-				copyLen := int64(len(p))
-				if start+copyLen > int64(n) {
-					copyLen = int64(n) - start
+		// 先尝试从缓存读取
+		hash := l.dedupManager.GetChunkHashByOffset(alignedOffset)
+		if hash != "" {
+			if cached, err := l.dedupManager.GetChunkCache().Get(hash); err == nil && cached != nil {
+				n, err := cached.ReadAt(chunk, 0)
+				if err == nil {
+					// 缓存命中,直接返回请求的部分
+					start := offset - alignedOffset
+					if start < int64(n) {
+						copyLen := int64(len(p))
+						if start+copyLen > int64(n) {
+							copyLen = int64(n) - start
+						}
+						copy(p, chunk[start:start+copyLen])
+						return int(copyLen), nil
+					}
 				}
-				copy(p, chunk[start:start+copyLen])
-				return int(copyLen), nil
 			}
 		}
 
-		// 读取新块
+		// 缓存未命中,读取新块
 		n, err := l.blob.ReadAt(chunk, alignedOffset, opts...)
 		if err != nil && err != io.EOF {
 			return 0, err
 		}
 
 		// 添加到去重缓存
+		hash = l.dedupManager.ChunkHash(chunk[:n])
+		l.dedupManager.SetChunkHashByOffset(alignedOffset, hash)
 		if err := l.dedupManager.AddChunk(chunk[:n]); err != nil {
 			return 0, err
 		}
 
-		// 只返回请求的部分
+		// 返回请求的部分
 		start := offset - alignedOffset
 		if start < int64(n) {
 			copyLen := int64(len(p))
@@ -656,7 +654,6 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 		}
 	}
 
-	// 如果没有启用去重,直接读取
 	return l.blob.ReadAt(p, offset, opts...)
 }
 

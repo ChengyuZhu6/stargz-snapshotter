@@ -40,6 +40,9 @@ type DedupManager struct {
 
 	// 层间共享的去重缓存
 	sharedCache sync.Map
+
+	// 块偏移到哈希的映射
+	offsetHashMap sync.Map
 }
 
 // 持久化的元数据结构
@@ -208,4 +211,17 @@ func (dm *DedupManager) GetChunkSize() int64 {
 // GetChunkCache returns the chunk cache
 func (dm *DedupManager) GetChunkCache() cache.BlobCache {
 	return dm.ChunkCache
+}
+
+// GetChunkHashByOffset returns the hash for a chunk at the given offset
+func (dm *DedupManager) GetChunkHashByOffset(offset int64) string {
+	if val, ok := dm.offsetHashMap.Load(offset); ok {
+		return val.(string)
+	}
+	return ""
+}
+
+// SetChunkHashByOffset sets the hash for a chunk at the given offset
+func (dm *DedupManager) SetChunkHashByOffset(offset int64, hash string) {
+	dm.offsetHashMap.Store(offset, hash)
 }
