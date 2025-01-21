@@ -6,7 +6,6 @@ import (
 	"os"
 	"sync"
 
-	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/cache"
 )
 
@@ -38,6 +37,9 @@ type DedupManager struct {
 	// 内存使用统计
 	MemUsage   int64
 	MemUsageMu sync.Mutex
+
+	// 层间共享的去重缓存
+	sharedCache sync.Map
 }
 
 // 持久化的元数据结构
@@ -160,44 +162,42 @@ func (dm *DedupManager) checkMemUsage(size int64) bool {
 
 // 添加块级别去重
 func (dm *DedupManager) AddChunk(data []byte) error {
-	if !dm.checkMemUsage(int64(len(data))) {
-		// 超过内存限制,跳过去重
+	hash := dm.ChunkHash(data)
+
+	// 先检查是否在共享缓存中
+	if _, ok := dm.sharedCache.Load(hash); ok {
 		return nil
 	}
-
-	hash := dm.ChunkHash(data)
 
 	dm.chunkRefsMu.Lock()
 	defer dm.chunkRefsMu.Unlock()
 
 	if _, ok := dm.ChunkRefs[hash]; ok {
-		// 块已存在,增加引用计数
 		dm.ChunkRefs[hash]++
 		return nil
 	}
 
-	// 新块,写入缓存
+	// 新块写入缓存
 	w, err := dm.ChunkCache.Add(hash)
 	if err != nil {
 		return err
 	}
 	defer w.Close()
+
 	if _, err := w.Write(data); err != nil {
 		w.Abort()
 		return err
 	}
+
 	if err := w.Commit(); err != nil {
 		return err
 	}
 
 	dm.ChunkRefs[hash] = 1
+	// 添加到共享缓存
+	dm.sharedCache.Store(hash, struct{}{})
 
-	// 定期保存元数据
-	if err := dm.saveMetadata(); err != nil {
-		log.L.WithError(err).Warn("failed to save dedup metadata")
-	}
-
-	return nil
+	return dm.saveMetadata()
 }
 
 // GetChunkSize returns the chunk size used for deduplication

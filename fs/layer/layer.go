@@ -603,35 +603,61 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 		}
 
 		chunkSize := l.dedupManager.GetChunkSize()
-		if len(p) > int(chunkSize) {
-			p = p[:chunkSize]
+		// 按块大小对齐读取
+		alignedOffset := (offset / chunkSize) * chunkSize
+		readSize := chunkSize
+		if alignedOffset+chunkSize > l.blob.Size() {
+			readSize = l.blob.Size() - alignedOffset
 		}
+		chunk := make([]byte, readSize)
 
-		// 检查是否有重复块
-		hash := l.dedupManager.ChunkHash(p)
+		// 先检查是否有重复块
+		hash := l.dedupManager.ChunkHash(chunk)
 		if cached, err := l.dedupManager.GetChunkCache().Get(hash); err == nil {
-			// Verify cache is still valid
 			if cached == nil {
 				return 0, fmt.Errorf("invalid cache entry")
 			}
-			return cached.ReadAt(p, 0)
+			n, err := cached.ReadAt(chunk, 0)
+			if err != nil {
+				return 0, err
+			}
+			// 只复制请求的部分
+			start := offset - alignedOffset
+			if start < int64(n) {
+				copyLen := int64(len(p))
+				if start+copyLen > int64(n) {
+					copyLen = int64(n) - start
+				}
+				copy(p, chunk[start:start+copyLen])
+				return int(copyLen), nil
+			}
+		}
+
+		// 读取新块
+		n, err := l.blob.ReadAt(chunk, alignedOffset, opts...)
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+
+		// 添加到去重缓存
+		if err := l.dedupManager.AddChunk(chunk[:n]); err != nil {
+			return 0, err
+		}
+
+		// 只返回请求的部分
+		start := offset - alignedOffset
+		if start < int64(n) {
+			copyLen := int64(len(p))
+			if start+copyLen > int64(n) {
+				copyLen = int64(n) - start
+			}
+			copy(p, chunk[start:start+copyLen])
+			return int(copyLen), nil
 		}
 	}
 
-	// 读取新块
-	n, err := l.blob.ReadAt(p, offset, opts...)
-	if err != nil {
-		return n, err
-	}
-
-	// 添加到去重缓存
-	if l.dedupManager != nil {
-		if err := l.dedupManager.AddChunk(p[:n]); err != nil {
-			return n, err
-		}
-	}
-
-	return n, nil
+	// 如果没有启用去重,直接读取
+	return l.blob.ReadAt(p, offset, opts...)
 }
 
 func (l *layer) close() error {
