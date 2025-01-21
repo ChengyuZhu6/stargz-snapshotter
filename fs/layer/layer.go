@@ -38,6 +38,7 @@ import (
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/containerd/stargz-snapshotter/estargz/zstdchunked"
 	"github.com/containerd/stargz-snapshotter/fs/config"
+	"github.com/containerd/stargz-snapshotter/fs/dedup"
 	commonmetrics "github.com/containerd/stargz-snapshotter/fs/metrics/common"
 	"github.com/containerd/stargz-snapshotter/fs/reader"
 	"github.com/containerd/stargz-snapshotter/fs/remote"
@@ -98,6 +99,9 @@ type Layer interface {
 	// Done releases the reference to this layer. The resources related to this layer will be
 	// discarded sooner or later. Queries after calling this function won't be serviced.
 	Done()
+
+	// SetDedupManager sets the dedup manager for this layer.
+	SetDedupManager(dm *dedup.DedupManager)
 }
 
 // Info is the current status of a layer.
@@ -405,6 +409,8 @@ type layer struct {
 	prefetchOnce        sync.Once
 	backgroundFetchOnce sync.Once
 	passThrough         bool
+
+	dedupManager *dedup.DedupManager
 }
 
 func (l *layer) Info() Info {
@@ -590,7 +596,34 @@ func (l *layer) RootNode(baseInode uint32) (fusefs.InodeEmbedder, error) {
 }
 
 func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, error) {
-	return l.blob.ReadAt(p, offset, opts...)
+	if l.dedupManager != nil {
+		chunkSize := l.dedupManager.GetChunkSize()
+		if len(p) > int(chunkSize) {
+			p = p[:chunkSize]
+		}
+
+		// 检查是否有重复块
+		hash := l.dedupManager.ChunkHash(p)
+		if cached, err := l.dedupManager.GetChunkCache().Get(hash); err == nil {
+			// 从缓存读取到buffer
+			return cached.ReadAt(p, 0)
+		}
+	}
+
+	// 读取新块
+	n, err := l.blob.ReadAt(p, offset, opts...)
+	if err != nil {
+		return n, err
+	}
+
+	// 添加到去重缓存
+	if l.dedupManager != nil {
+		if err := l.dedupManager.AddChunk(p[:n]); err != nil {
+			return n, err
+		}
+	}
+
+	return n, nil
 }
 
 func (l *layer) close() error {
@@ -682,3 +715,7 @@ func (w *waiter) wait(timeout time.Duration) error {
 type readerAtFunc func([]byte, int64) (int, error)
 
 func (f readerAtFunc) ReadAt(p []byte, offset int64) (int, error) { return f(p, offset) }
+
+func (l *layer) SetDedupManager(dm *dedup.DedupManager) {
+	l.dedupManager = dm
+}

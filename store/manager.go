@@ -19,6 +19,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,8 +27,10 @@ import (
 
 	"github.com/containerd/containerd/v2/pkg/reference"
 	"github.com/containerd/log"
+	"github.com/containerd/stargz-snapshotter/cache"
 	"github.com/containerd/stargz-snapshotter/estargz/zstdchunked"
 	"github.com/containerd/stargz-snapshotter/fs/config"
+	"github.com/containerd/stargz-snapshotter/fs/dedup"
 	"github.com/containerd/stargz-snapshotter/fs/layer"
 	layermetrics "github.com/containerd/stargz-snapshotter/fs/metrics/layer"
 	"github.com/containerd/stargz-snapshotter/fs/source"
@@ -46,6 +49,10 @@ const (
 	prepareFailed        = "false"
 
 	defaultMaxConcurrency = 2
+
+	// Default values for deduplication
+	defaultDedupCacheSize = 10000 // Default number of entries in dedup cache
+	defaultDedupChunkSize = 65536 // Default chunk size (64KB) for deduplication
 )
 
 func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHosts, metadataStore metadata.Store, cfg config.Config) (*LayerManager, error) {
@@ -74,6 +81,47 @@ func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHost
 	if ns != nil {
 		metrics.Register(ns)
 	}
+
+	var dm *dedup.DedupManager
+	if cfg.EnableLayerDedup || cfg.EnableChunkDedup {
+		// Apply defaults if not set
+		if cfg.DedupCacheSize == 0 {
+			cfg.DedupCacheSize = defaultDedupCacheSize
+		}
+		if cfg.DedupChunkSize == 0 {
+			cfg.DedupChunkSize = defaultDedupChunkSize
+		}
+
+		fileCacheConfig := cache.DirectoryCacheConfig{
+			MaxLRUCacheEntry: int(cfg.DedupCacheSize),
+		}
+		chunkCacheConfig := cache.DirectoryCacheConfig{
+			MaxLRUCacheEntry: int(cfg.DedupCacheSize),
+		}
+		fileCache, err := cache.NewDirectoryCache(filepath.Join(root, "dedup-files"), fileCacheConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dedup file cache: %w", err)
+		}
+		chunkCache, err := cache.NewDirectoryCache(filepath.Join(root, "dedup-chunks"), chunkCacheConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dedup chunk cache: %w", err)
+		}
+		dm = &dedup.DedupManager{
+			FileCache:    fileCache,
+			ChunkCache:   chunkCache,
+			FileRefs:     make(map[string]int),
+			ChunkRefs:    make(map[string]int),
+			ChunkSize:    cfg.DedupChunkSize,
+			MemCacheSize: cfg.DedupMemCacheSize * 1024 * 1024,
+			MetadataPath: cfg.DedupMetadataPath,
+		}
+
+		// 加载持久化的元数据
+		if err := dm.LoadMetadata(); err != nil {
+			log.L.WithError(err).Warn("failed to load dedup metadata")
+		}
+	}
+
 	return &LayerManager{
 		refPool:               refPool,
 		hosts:                 hosts,
@@ -86,6 +134,7 @@ func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHost
 		resolveLock:           new(namedmutex.NamedMutex),
 		layer:                 make(map[string]map[string]layer.Layer),
 		refcounter:            make(map[string]map[string]int),
+		dedupManager:          dm,
 	}, nil
 }
 
@@ -108,6 +157,8 @@ type LayerManager struct {
 	resolveLayerCache map[string]map[string]error // keyed by image ref and layer digest (not TOCDigest)
 
 	mu sync.Mutex
+
+	dedupManager *dedup.DedupManager
 }
 
 func (r *LayerManager) cacheLayer(refspec reference.Spec, tocDigest digest.Digest, l layer.Layer) (_ layer.Layer, added bool) {

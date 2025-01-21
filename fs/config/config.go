@@ -86,6 +86,24 @@ type Config struct {
 
 	// ResolveResultEntry is a deprecated field.
 	ResolveResultEntry int `toml:"resolve_result_entry"` // deprecated
+
+	// 是否启用跨层去重
+	EnableLayerDedup bool `toml:"enable_layer_dedup"`
+
+	// 是否启用块级别去重
+	EnableChunkDedup bool `toml:"enable_chunk_dedup"`
+
+	// 去重缓存大小(MB)
+	DedupCacheSize int64 `toml:"dedup_cache_size"`
+
+	// 去重块大小(KB),默认为64KB
+	DedupChunkSize int64 `toml:"dedup_chunk_size"`
+
+	// 去重元数据持久化路径
+	DedupMetadataPath string `toml:"dedup_metadata_path"`
+
+	// 去重内存缓存大小(MB),超过后将淘汰最早数据
+	DedupMemCacheSize int64 `toml:"dedup_mem_cache_size"`
 }
 
 // BlobConfig is configuration for the logic to fetching blobs.
@@ -121,7 +139,7 @@ type BlobConfig struct {
 	// MinWaitMSec is minimal delay (in seconds) for the next retrying after a request failure. Default is 30.
 	MinWaitMSec int `toml:"min_wait_msec"`
 
-	// MinWaitMSec is maximum delay (in seconds) for the next retrying after a request failure. Default is 30.
+	// MaxWaitMSec is maximum delay (in seconds) for the next retrying after a request failure. Default is 30.
 	MaxWaitMSec int `toml:"max_wait_msec"`
 }
 
