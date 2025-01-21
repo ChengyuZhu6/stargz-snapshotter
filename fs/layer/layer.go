@@ -597,6 +597,11 @@ func (l *layer) RootNode(baseInode uint32) (fusefs.InodeEmbedder, error) {
 
 func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, error) {
 	if l.dedupManager != nil {
+		// Check if layer is still valid
+		if l.isClosed() {
+			return 0, fmt.Errorf("layer is closed")
+		}
+
 		chunkSize := l.dedupManager.GetChunkSize()
 		if len(p) > int(chunkSize) {
 			p = p[:chunkSize]
@@ -605,7 +610,10 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 		// 检查是否有重复块
 		hash := l.dedupManager.ChunkHash(p)
 		if cached, err := l.dedupManager.GetChunkCache().Get(hash); err == nil {
-			// 从缓存读取到buffer
+			// Verify cache is still valid
+			if cached == nil {
+				return 0, fmt.Errorf("invalid cache entry")
+			}
 			return cached.ReadAt(p, 0)
 		}
 	}
