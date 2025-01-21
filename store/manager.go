@@ -19,6 +19,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -56,6 +57,9 @@ const (
 )
 
 func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHosts, metadataStore metadata.Store, cfg config.Config) (*LayerManager, error) {
+	log.L.Infof("Initializing LayerManager with config: EnableChunkDedup=%v, DedupChunkSize=%d, DedupCacheSize=%d",
+		cfg.EnableChunkDedup, cfg.DedupChunkSize, cfg.DedupCacheSize)
+
 	refPool, err := newRefPool(ctx, root, hosts)
 	if err != nil {
 		return nil, err
@@ -83,7 +87,8 @@ func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHost
 	}
 
 	var dm *dedup.DedupManager
-	if cfg.EnableLayerDedup || cfg.EnableChunkDedup {
+	if cfg.EnableChunkDedup {
+		log.L.Info("Chunk deduplication is enabled, initializing DedupManager")
 		// Apply defaults if not set
 		if cfg.DedupCacheSize == 0 {
 			cfg.DedupCacheSize = defaultDedupCacheSize
@@ -92,20 +97,41 @@ func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHost
 			cfg.DedupChunkSize = defaultDedupChunkSize
 		}
 
+		log.L.Infof("Using dedup settings: ChunkSize=%d, CacheSize=%d, MetadataPath=%s",
+			cfg.DedupChunkSize, cfg.DedupCacheSize, cfg.DedupMetadataPath)
+
+		// Create dedup directories
+		dedupRoot := filepath.Join(root, "dedup")
+		log.L.Infof("Creating dedup root directory at: %s", dedupRoot)
+		if err := os.MkdirAll(dedupRoot, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create dedup root directory: %w", err)
+		}
+
+		// If metadata path is not set, use default
+		if cfg.DedupMetadataPath == "" {
+			cfg.DedupMetadataPath = filepath.Join(dedupRoot, "metadata.json")
+		}
+
+		// Ensure metadata directory exists
+		if err := os.MkdirAll(filepath.Dir(cfg.DedupMetadataPath), 0755); err != nil {
+			return nil, fmt.Errorf("failed to create metadata directory: %w", err)
+		}
+
 		fileCacheConfig := cache.DirectoryCacheConfig{
 			MaxLRUCacheEntry: int(cfg.DedupCacheSize),
 		}
 		chunkCacheConfig := cache.DirectoryCacheConfig{
 			MaxLRUCacheEntry: int(cfg.DedupCacheSize),
 		}
-		fileCache, err := cache.NewDirectoryCache(filepath.Join(root, "dedup-files"), fileCacheConfig)
+		fileCache, err := cache.NewDirectoryCache(filepath.Join(dedupRoot, "files"), fileCacheConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create dedup file cache: %w", err)
 		}
-		chunkCache, err := cache.NewDirectoryCache(filepath.Join(root, "dedup-chunks"), chunkCacheConfig)
+		chunkCache, err := cache.NewDirectoryCache(filepath.Join(dedupRoot, "chunks"), chunkCacheConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create dedup chunk cache: %w", err)
 		}
+
 		dm = &dedup.DedupManager{
 			FileCache:    fileCache,
 			ChunkCache:   chunkCache,
@@ -115,11 +141,9 @@ func NewLayerManager(ctx context.Context, root string, hosts source.RegistryHost
 			MemCacheSize: cfg.DedupMemCacheSize * 1024 * 1024,
 			MetadataPath: cfg.DedupMetadataPath,
 		}
-
-		// 加载持久化的元数据
-		if err := dm.LoadMetadata(); err != nil {
-			log.L.WithError(err).Warn("failed to load dedup metadata")
-		}
+		log.L.Info("DedupManager initialized successfully")
+	} else {
+		log.L.Info("Chunk deduplication is disabled")
 	}
 
 	return &LayerManager{

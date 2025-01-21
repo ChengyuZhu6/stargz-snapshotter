@@ -597,6 +597,7 @@ func (l *layer) RootNode(baseInode uint32) (fusefs.InodeEmbedder, error) {
 
 func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, error) {
 	if l.dedupManager != nil {
+		log.L.Debugf("Using dedup for read at offset %d, size %d", offset, len(p))
 		log.L.Infof("Starting dedup read at offset %d, size %d", offset, len(p))
 
 		if l.isClosed() {
@@ -660,8 +661,9 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 		log.L.Infof("Returning new data: start=%d, copyLen=%d", start, copyLen)
 		copy(p, chunk[start:start+copyLen])
 		return int(copyLen), nil
+	} else {
+		log.L.Debugf("Dedup not enabled for read at offset %d, size %d", offset, len(p))
 	}
-
 	return l.blob.ReadAt(p, offset, opts...)
 }
 
@@ -756,5 +758,8 @@ type readerAtFunc func([]byte, int64) (int, error)
 func (f readerAtFunc) ReadAt(p []byte, offset int64) (int, error) { return f(p, offset) }
 
 func (l *layer) SetDedupManager(dm *dedup.DedupManager) {
+	if dm != nil {
+		log.L.Info("Setting DedupManager for layer")
+	}
 	l.dedupManager = dm
 }
