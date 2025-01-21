@@ -597,6 +597,8 @@ func (l *layer) RootNode(baseInode uint32) (fusefs.InodeEmbedder, error) {
 
 func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, error) {
 	if l.dedupManager != nil {
+		log.L.Infof("Starting dedup read at offset %d, size %d", offset, len(p))
+
 		if l.isClosed() {
 			return 0, fmt.Errorf("layer is closed")
 		}
@@ -607,28 +609,33 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 		if alignedOffset+chunkSize > l.blob.Size() {
 			readSize = l.blob.Size() - alignedOffset
 		}
+		log.L.Infof("Aligned read: offset=%d, size=%d", alignedOffset, readSize)
+
 		chunk := make([]byte, readSize)
 
 		// 先尝试从缓存读取
 		hash := l.dedupManager.GetChunkHashByOffset(alignedOffset)
+		log.L.Infof("Looking up chunk hash for offset %d: %s", alignedOffset, hash)
+
 		if hash != "" {
 			if cached, err := l.dedupManager.GetChunkCache().Get(hash); err == nil && cached != nil {
+				log.L.Infof("Cache hit for hash %s", hash)
 				n, err := cached.ReadAt(chunk, 0)
 				if err == nil {
-					// 缓存命中,直接返回请求的部分
 					start := offset - alignedOffset
-					if start < int64(n) {
-						copyLen := int64(len(p))
-						if start+copyLen > int64(n) {
-							copyLen = int64(n) - start
-						}
-						copy(p, chunk[start:start+copyLen])
-						return int(copyLen), nil
+					copyLen := int64(len(p))
+					if start+copyLen > int64(n) {
+						copyLen = int64(n) - start
 					}
+					log.L.Infof("Returning cached data: start=%d, copyLen=%d", start, copyLen)
+					copy(p, chunk[start:start+copyLen])
+					return int(copyLen), nil
 				}
+				log.L.Warnf("Failed to read from cache: %v", err)
 			}
 		}
 
+		log.L.Info("Cache miss, reading from blob")
 		// 缓存未命中,读取新块
 		n, err := l.blob.ReadAt(chunk, alignedOffset, opts...)
 		if err != nil && err != io.EOF {
@@ -637,21 +644,22 @@ func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, erro
 
 		// 添加到去重缓存
 		hash = l.dedupManager.ChunkHash(chunk[:n])
+		log.L.Infof("Adding chunk to cache: offset=%d, size=%d, hash=%s", alignedOffset, n, hash)
 		l.dedupManager.SetChunkHashByOffset(alignedOffset, hash)
 		if err := l.dedupManager.AddChunk(chunk[:n]); err != nil {
+			log.L.Warnf("Failed to add chunk to cache: %v", err)
 			return 0, err
 		}
 
 		// 返回请求的部分
 		start := offset - alignedOffset
-		if start < int64(n) {
-			copyLen := int64(len(p))
-			if start+copyLen > int64(n) {
-				copyLen = int64(n) - start
-			}
-			copy(p, chunk[start:start+copyLen])
-			return int(copyLen), nil
+		copyLen := int64(len(p))
+		if start+copyLen > int64(n) {
+			copyLen = int64(n) - start
 		}
+		log.L.Infof("Returning new data: start=%d, copyLen=%d", start, copyLen)
+		copy(p, chunk[start:start+copyLen])
+		return int(copyLen), nil
 	}
 
 	return l.blob.ReadAt(p, offset, opts...)

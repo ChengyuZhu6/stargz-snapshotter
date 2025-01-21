@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/cache"
 )
 
@@ -166,9 +167,11 @@ func (dm *DedupManager) checkMemUsage(size int64) bool {
 // 添加块级别去重
 func (dm *DedupManager) AddChunk(data []byte) error {
 	hash := dm.ChunkHash(data)
+	log.L.Infof("Adding chunk: size=%d, hash=%s", len(data), hash)
 
 	// 先检查是否在共享缓存中
 	if _, ok := dm.sharedCache.Load(hash); ok {
+		log.L.Infof("Chunk already in shared cache: %s", hash)
 		return nil
 	}
 
@@ -176,29 +179,34 @@ func (dm *DedupManager) AddChunk(data []byte) error {
 	defer dm.chunkRefsMu.Unlock()
 
 	if _, ok := dm.ChunkRefs[hash]; ok {
+		log.L.Infof("Chunk exists, incrementing ref count: %s", hash)
 		dm.ChunkRefs[hash]++
 		return nil
 	}
 
+	log.L.Infof("Writing new chunk to cache: %s", hash)
 	// 新块写入缓存
 	w, err := dm.ChunkCache.Add(hash)
 	if err != nil {
+		log.L.Warnf("Failed to add chunk to cache: %v", err)
 		return err
 	}
 	defer w.Close()
 
 	if _, err := w.Write(data); err != nil {
+		log.L.Warnf("Failed to write chunk data: %v", err)
 		w.Abort()
 		return err
 	}
 
 	if err := w.Commit(); err != nil {
+		log.L.Warnf("Failed to commit chunk: %v", err)
 		return err
 	}
 
 	dm.ChunkRefs[hash] = 1
-	// 添加到共享缓存
 	dm.sharedCache.Store(hash, struct{}{})
+	log.L.Infof("Successfully added new chunk: %s", hash)
 
 	return dm.saveMetadata()
 }
