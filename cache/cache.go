@@ -309,6 +309,20 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		return nil, fmt.Errorf("cache is already closed")
 	}
 
+	// Check hardlink first before creating new cache file
+	if dc.hlManager != nil {
+		if linkPath, exists := dc.hlManager.GetLink(key); exists {
+			if _, err := os.Stat(linkPath); err == nil {
+				// Hardlink exists and is valid, use it
+				return &writer{
+					WriteCloser: nopWriteCloser(io.Discard),
+					commitFunc:  func() error { return nil },
+					abortFunc:   func() error { return nil },
+				}, nil
+			}
+		}
+	}
+
 	// 1. Create temporary file
 	w, err := dc.wipFile(key)
 	if err != nil {

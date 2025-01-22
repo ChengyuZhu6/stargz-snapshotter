@@ -89,7 +89,7 @@ func GetGlobalHardlinkManager(root string) (*HardlinkManager, error) {
 	return globalHLManager, nil
 }
 
-// CreateLink creates a hardlink
+// CreateLink creates a hardlink with retry logic
 func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
@@ -108,6 +108,95 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
 	}
 
 	// Create temporary link path
+	tmpLinkPath := linkPath + ".tmp"
+
+	// Remove temporary link if it exists
+	os.Remove(tmpLinkPath)
+
+	// Retry logic for creating hardlink
+	const maxRetries = 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		if err := os.Link(sourcePath, tmpLinkPath); err != nil {
+			lastErr = err
+			// Add delay between retries
+			if i < maxRetries-1 {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("failed to create temporary hardlink after %d attempts: %w", maxRetries, lastErr)
+		}
+		break
+	}
+
+	// Verify the temporary link
+	tmpInfo, err := os.Stat(tmpLinkPath)
+	if err != nil {
+		os.Remove(tmpLinkPath)
+		return fmt.Errorf("failed to stat temporary link: %w", err)
+	}
+
+	if !os.SameFile(sourceInfo, tmpInfo) {
+		os.Remove(tmpLinkPath)
+		return fmt.Errorf("temporary link verification failed - different inodes")
+	}
+
+	// Atomically rename temporary link to final location
+	if err := os.Rename(tmpLinkPath, linkPath); err != nil {
+		os.Remove(tmpLinkPath)
+		return fmt.Errorf("failed to rename temporary link: %w", err)
+	}
+
+	// Record link info
+	hm.links[key] = &linkInfo{
+		SourcePath: sourcePath,
+		LinkPath:   linkPath,
+		CreatedAt:  time.Now(),
+		LastUsed:   time.Now(),
+	}
+
+	// Persist link info
+	return hm.persist()
+}
+
+// CreateLinks creates multiple hardlinks in batch
+func (hm *HardlinkManager) CreateLinks(links map[string]string) error {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	// Pre-create all directories
+	dirs := make(map[string]struct{})
+	for key := range links {
+		dir := filepath.Join(hm.hlDir, key[:2])
+		dirs[dir] = struct{}{}
+	}
+	for dir := range dirs {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("failed to create link dir %s: %w", dir, err)
+		}
+	}
+
+	// Create all links
+	for key, sourcePath := range links {
+		if err := hm.createSingleLink(key, sourcePath); err != nil {
+			return fmt.Errorf("failed to create link for %s: %w", key, err)
+		}
+	}
+
+	// Persist all link info at once
+	return hm.persist()
+}
+
+func (hm *HardlinkManager) createSingleLink(key string, sourcePath string) error {
+	// Add debug info about source file
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		log.L.Debugf("Source file stat failed %q: %v", sourcePath, err)
+		return fmt.Errorf("failed to stat source file: %w", err)
+	}
+
+	// Create hardlink path
+	linkPath := filepath.Join(hm.hlDir, key[:2], key)
 	tmpLinkPath := linkPath + ".tmp"
 
 	// Remove temporary link if it exists
@@ -136,16 +225,6 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
 		return fmt.Errorf("failed to rename temporary link: %w", err)
 	}
 
-	// Final verification
-	finalInfo, err := os.Stat(linkPath)
-	if err != nil {
-		return fmt.Errorf("failed to stat final link: %w", err)
-	}
-
-	if !os.SameFile(sourceInfo, finalInfo) {
-		return fmt.Errorf("final link verification failed - different inodes")
-	}
-
 	// Record link info
 	hm.links[key] = &linkInfo{
 		SourcePath: sourcePath,
@@ -154,8 +233,7 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
 		LastUsed:   time.Now(),
 	}
 
-	// Persist link info
-	return hm.persist()
+	return nil
 }
 
 // GetLink gets the hardlink
@@ -185,25 +263,29 @@ func (hm *HardlinkManager) cleanup() error {
 	defer hm.mu.Unlock()
 
 	now := time.Now()
-	removed := 0
+	expiredKeys := make([]string, 0)
+
+	// Find expired links
 	for key, info := range hm.links {
-		// Clean up links unused for over 30 days
 		if now.Sub(info.LastUsed) > 30*24*time.Hour {
-			if err := os.Remove(info.LinkPath); err != nil && !os.IsNotExist(err) {
-				log.L.Infof("Failed to remove expired hardlink %q: %v", info.LinkPath, err)
-				return fmt.Errorf("failed to remove expired link: %w", err)
-			}
-			delete(hm.links, key)
-			removed++
-			log.L.Debugf("Removed expired hardlink %q (last used: %v)", info.LinkPath, info.LastUsed)
+			expiredKeys = append(expiredKeys, key)
 		}
 	}
 
-	if removed > 0 {
-		log.L.Debugf("Cleaned up %d expired hardlinks", removed)
+	// Remove expired links in batch
+	for _, key := range expiredKeys {
+		info := hm.links[key]
+		if err := os.Remove(info.LinkPath); err != nil && !os.IsNotExist(err) {
+			log.L.Warnf("Failed to remove expired hardlink %q: %v", info.LinkPath, err)
+			continue
+		}
+		delete(hm.links, key)
 	}
 
-	return hm.persist()
+	if len(expiredKeys) > 0 {
+		return hm.persist()
+	}
+	return nil
 }
 
 // periodicCleanup performs periodic cleanup
