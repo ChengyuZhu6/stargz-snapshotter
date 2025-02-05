@@ -236,7 +236,7 @@ func (vr *VerifiableReader) readAndCache(id uint32, fr io.Reader, chunkOffset, c
 	}
 
 	// Check if it already exists in the cache
-	cacheID := genID(id, chunkOffset, chunkSize)
+	cacheID := genID(id, chunkSize, chunkDigest)
 	if r, err := gr.cache.Get(cacheID); err == nil {
 		r.Close()
 		return nil
@@ -361,7 +361,7 @@ func (gr *reader) OpenFile(id uint32) (io.ReaderAt, error) {
 	var fr metadata.File
 	fr, err := gr.r.OpenFileWithPreReader(id, func(nid uint32, chunkOffset, chunkSize int64, chunkDigest string, r io.Reader) error {
 		// Check if it already exists in the cache
-		cacheID := genID(nid, chunkOffset, chunkSize)
+		cacheID := genID(nid, chunkSize, chunkDigest)
 		if r, err := gr.cache.Get(cacheID); err == nil {
 			r.Close()
 			return nil
@@ -435,7 +435,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			break
 		}
 		var (
-			id           = genID(sf.id, chunkOffset, chunkSize)
+			id           = genID(sf.id, chunkSize, chunkDigestStr)
 			lowerDiscard = positive(offset - chunkOffset)
 			upperDiscard = positive(chunkOffset + chunkSize - (offset + int64(len(p))))
 			expectedSize = chunkSize - upperDiscard - lowerDiscard
@@ -514,7 +514,7 @@ func (sf *file) GetPassthroughFd() (uintptr, error) {
 		offset = chunkOffset + chunkSize
 	}
 
-	id := genID(sf.id, firstChunkOffset, totalSize)
+	id := genID(sf.id, totalSize, "")
 
 	// cache.PassThrough() is necessary to take over files
 	r, err := sf.gr.cache.Get(id, cache.PassThrough())
@@ -564,7 +564,7 @@ func (sf *file) prefetchEntireFile(entireCacheID string) error {
 			firstChunkOffset = chunkOffset
 		}
 
-		id := genID(sf.id, chunkOffset, chunkSize)
+		id := genID(sf.id, chunkSize, chunkDigestStr)
 		b := sf.gr.bufPool.Get().(*bytes.Buffer)
 		b.Reset()
 		b.Grow(int(chunkSize))
@@ -662,8 +662,8 @@ func (gr *reader) verifyChunk(id uint32, p []byte, chunkDigestStr string) error 
 	return nil
 }
 
-func genID(id uint32, offset, size int64) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d-%d-%d", id, offset, size)))
+func genID(id uint32, size int64, digest string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d-%d-%s", id, size, digest)))
 	return fmt.Sprintf("%x", sum)
 }
 
