@@ -77,7 +77,7 @@ def genargs_for_optimization(arg):
 
 def format_repo(mode, repository, name):
     if mode == ESTARGZ_MODE:
-        return "%s/%s-esgz" % (repository, name)
+        return "%s/%s-estargz" % (repository, name)
     elif mode == ESTARGZ_NOOPT_MODE:
         return "%s/%s-esgz-noopt" % (repository, name)
     elif mode == ZSTDCHUNKED_MODE:

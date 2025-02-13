@@ -23,16 +23,16 @@ REPO="${CONTEXT}../../"
 export DOCKER_BUILDKIT=1
 
 BENCHMARK_TARGETS="${BENCHMARK_TARGETS:-}"
-if [[ -z "$BENCHMARK_TARGETS" ]]; then
-  echo "BENCHMARK_TARGETS must be specified."
-  exit 1
-fi
+# if [[ -z "$BENCHMARK_TARGETS" ]]; then
+#   echo "BENCHMARK_TARGETS must be specified."
+#   exit 1
+# fi
 
 BENCHMARKING_BASE_IMAGE_NAME="benchmark-image-base"
 BENCHMARKING_NODE_IMAGE_NAME="benchmark-image-test"
 BENCHMARKING_NODE=hello-bench
 BENCHMARKING_CONTAINER=hello-bench-container
-BENCHMARK_USER=${BENCHMARK_USER:-stargz-containers}
+# BENCHMARK_USER=${BENCHMARK_USER:-stargz-containers}
 export BENCHMARK_RUNTIME_MODE=${BENCHMARK_RUNTIME_MODE:-containerd}
 
 BENCHMARKING_TARGET_BASE_IMAGE=
@@ -131,6 +131,7 @@ touch "${LOG_FILE}"
 echo "Logging to >>> ${LOG_FILE} (will finally be stored under ${OUTPUTDIR})"
 
 echo "Benchmarking..."
+echo  "${BENCHMARK_REGISTRY}/${BENCHMARK_TARGETS}"
 FAIL=
 if ! ( cd "${CONTEXT}" && \
            docker compose -f "${DOCKER_COMPOSE_YAML}" build ${DOCKER_BUILD_ARGS:-} \
@@ -140,8 +141,9 @@ if ! ( cd "${CONTEXT}" && \
 		  -e BENCHMARK_RUNTIME_MODE -e BENCHMARK_SAMPLES_NUM -e BENCHMARK_PROFILE \
                   -i "${BENCHMARKING_CONTAINER}" \
                   script/benchmark/hello-bench/run.sh \
-                  "${BENCHMARK_REGISTRY:-ghcr.io}/${BENCHMARK_USER}" \
-                  ${BENCHMARK_TARGETS} &> "${LOG_FILE}" ) ; then
+                  "${BENCHMARK_REGISTRY}" \
+                  "${BENCHMARK_TARGETS}" \
+                  &> "${LOG_FILE}" ) ; then
     echo "Failed to run benchmark."
     FAIL=true
 fi

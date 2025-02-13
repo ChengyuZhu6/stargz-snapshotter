@@ -17,7 +17,7 @@
 set -euo pipefail
 
 LEGACY_MODE="legacy"
-ESTARGZ_NOOPT_MODE="estargz-noopt"
+# ESTARGZ_NOOPT_MODE="estargz-noopt"
 ESTARGZ_MODE="estargz"
 ZSTDCHUNKED_MODE="zstdchunked"
 
@@ -102,8 +102,10 @@ for SAMPLE_NO in $(seq ${NUM_OF_SAMPLES}) ; do
     echo -n "" > "${WORKLOADS_LIST}"
     # Randomize workloads
     for IMAGE in ${TARGET_IMAGES} ; do
-        for MODE in ${LEGACY_MODE} ${ESTARGZ_NOOPT_MODE} ${ESTARGZ_MODE} ${ZSTDCHUNKED_MODE} ; do
+        echo "${IMAGE}"
+        for MODE in ${LEGACY_MODE} ${ESTARGZ_MODE} ${ZSTDCHUNKED_MODE} ; do
             echo "${IMAGE},${MODE}" >> "${WORKLOADS_LIST}"
+            echo "${IMAGE},${MODE};   ${WORKLOADS_LIST}"
         done
     done
     sort -R -o "${WORKLOADS_LIST}" "${WORKLOADS_LIST}"
@@ -125,13 +127,13 @@ for SAMPLE_NO in $(seq ${NUM_OF_SAMPLES}) ; do
             measure "--mode=legacy" ${TARGET_REPOSITORY} ${IMAGE} "$additional_flags"
         fi
 
-        if [ "${MODE}" == "${ESTARGZ_NOOPT_MODE}" ] ; then
-            echo -n "" > "${TMP_LOG_FILE}"
-            # disable prefetch
-            DISABLE_PREFETCH="true" LOG_FILE="${TMP_LOG_FILE}" "${REBOOT_SCRIPT}"
-            measure "--mode=estargz-noopt" ${TARGET_REPOSITORY} ${IMAGE} "$additional_flags"
-            check_remote_snapshots "${TMP_LOG_FILE}"
-        fi
+        # if [ "${MODE}" == "${ESTARGZ_NOOPT_MODE}" ] ; then
+        #     echo -n "" > "${TMP_LOG_FILE}"
+        #     # disable prefetch
+        #     DISABLE_PREFETCH="true" LOG_FILE="${TMP_LOG_FILE}" "${REBOOT_SCRIPT}"
+        #     measure "--mode=estargz-noopt" ${TARGET_REPOSITORY} ${IMAGE} "$additional_flags"
+        #     check_remote_snapshots "${TMP_LOG_FILE}"
+        # fi
 
         if [ "${MODE}" == "${ESTARGZ_MODE}" ] ; then
             echo -n "" > "${TMP_LOG_FILE}"
