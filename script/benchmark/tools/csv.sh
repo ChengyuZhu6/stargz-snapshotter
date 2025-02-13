@@ -16,6 +16,11 @@
 
 set -euo pipefail
 
+OUTPUTDIR="${BENCHMARK_RESULT_DIR:-}"
+if [ -z "${OUTPUTDIR}" ]; then
+    OUTPUTDIR="$(pwd)/benchmark"
+fi
+
 JSON="$(mktemp)"
 cat > "${JSON}"
 
@@ -44,30 +49,33 @@ for IMGNAME in "${IMAGES[@]}" ; do
     done
 done
 
-INDEX="image,operation"
+INDEX="image,operation,mem_usage_mb,disk_usage_mb"
 for MODE in "${MODES[@]}"; do
     INDEX="${INDEX},${MODE}"
 done
 echo "${INDEX}"
 for IMGNAME in "${IMAGES[@]}" ; do
+    MEM_USAGE=$(awk '{sum+=$2} END{if(NR>0) print sum/NR; else print 0}' "${OUTPUTDIR}/memory_usage.log")
+    DISK_USAGE=$(awk '{sum+=$2} END{if(NR>0) print sum/NR; else print 0}' "${OUTPUTDIR}/disk_usage.log")
+
     PULLLINE="${IMGNAME},pull"
     for MODE in "${MODES[@]}"; do
         PULLTIME=$(percentile "${JSON}" "${MINSAMPLES}" "${IMGNAME}" "${MODE}" "elapsed_pull")
         PULLLINE="${PULLLINE},${PULLTIME}"
     done
-    echo "${PULLLINE}"
+    echo "${PULLLINE},${MEM_USAGE},${DISK_USAGE}"
 
     CREATELINE="${IMGNAME},create"
     for MODE in "${MODES[@]}"; do
         CREATETIME=$(percentile "${JSON}" "${MINSAMPLES}" "${IMGNAME}" "${MODE}" "elapsed_create")
         CREATELINE="${CREATELINE},${CREATETIME}"
     done
-    echo "${CREATELINE}"
+    echo "${CREATELINE},${MEM_USAGE},${DISK_USAGE}"
 
     RUNLINE="${IMGNAME},run"
     for MODE in "${MODES[@]}"; do
         RUNTIME=$(percentile "${JSON}" "${MINSAMPLES}" "${IMGNAME}" "${MODE}" "elapsed_run")
         RUNLINE="${RUNLINE},${RUNTIME}"
     done
-    echo "${RUNLINE}"
+    echo "${RUNLINE},${MEM_USAGE},${DISK_USAGE}"
 done

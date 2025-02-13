@@ -130,12 +130,38 @@ LOG_FILE="${LOG_DIR}/containerd-stargz-grpc-benchmark-$(date '+%Y%m%d%H%M%S')"
 touch "${LOG_FILE}"
 echo "Logging to >>> ${LOG_FILE} (will finally be stored under ${OUTPUTDIR})"
 
+MEM_LOG="${OUTPUTDIR}/memory_usage.log"
+DISK_LOG="${OUTPUTDIR}/disk_usage.log"
+mkdir -p "${OUTPUTDIR}"
+touch "${MEM_LOG}" "${DISK_LOG}"
+
+# 定义监控函数
+function start_monitoring() {
+    while true; do
+        echo "Monitoring memory and disk..." >&2
+        free -m | awk '/Mem:/ {print strftime("%Y-%m-%d %H:%M:%S"), $3}' >> "${MEM_LOG}"
+        df -BM / | awk 'NR==2 {print strftime("%Y-%m-%d %H:%M:%S"), $3}' >> "${DISK_LOG}"
+        sleep 1
+    done
+}
+
+# Fix the order - start the process first before capturing PID
+start_monitoring &
+MONITOR_PID=$!
+
+function stop_monitoring() {
+    if ps -p $MONITOR_PID > /dev/null; then
+        kill $MONITOR_PID
+    fi
+}
+
 echo "Benchmarking..."
 FAIL=
 if ! ( cd "${CONTEXT}" && \
            docker compose -f "${DOCKER_COMPOSE_YAML}" build ${DOCKER_BUILD_ARGS:-} \
                           "${BENCHMARKING_NODE}" && \
            docker compose -f "${DOCKER_COMPOSE_YAML}" up -d --force-recreate && \
+           start_monitoring && \
            docker exec \
 		  -e BENCHMARK_RUNTIME_MODE -e BENCHMARK_SAMPLES_NUM -e BENCHMARK_PROFILE \
                   -i "${BENCHMARKING_CONTAINER}" \
@@ -146,12 +172,19 @@ if ! ( cd "${CONTEXT}" && \
     FAIL=true
 fi
 
+echo "Stopping monitoring..."
+stop_monitoring
+
 echo "Collecting data inside ${BENCHMARKING_CONTAINER}..."
+docker exec -i "${BENCHMARKING_CONTAINER}" mkdir -p /tmp/hello-bench-output
 docker exec -i "${BENCHMARKING_CONTAINER}" \
   tar zcf - -C /tmp/hello-bench-output . | tar zxvf - -C "$OUTPUTDIR"
 
 echo "Harvesting log ${LOG_FILE} -> ${OUTPUTDIR} ..."
 tar zcvf "${OUTPUTDIR}/result.log.tar.gz" "${LOG_FILE}"
+echo "Collecting monitoring data..."
+tar zcvf "${OUTPUTDIR}/memory_usage.log.tar.gz" "${OUTPUTDIR}/memory_usage.log"
+tar zcvf "${OUTPUTDIR}/disk_usage.log.tar.gz" "${OUTPUTDIR}/disk_usage.log"
 if [ "${FAIL}" != "true" ] ; then
     echo "Formatting output..."
     if ! ( tar zOxf "${OUTPUTDIR}/result.log.tar.gz" | "${CONTEXT}/tools/format.sh" > "${OUTPUTDIR}/result.json" && \
