@@ -1,6 +1,4 @@
 images:
-  - alpine:3.15.3
-  - fedora:35
-  - nginx:1.23.3
   - ubuntu:22.04
+  - fedora:35
 

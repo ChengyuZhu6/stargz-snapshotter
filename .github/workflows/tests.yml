@@ -7,6 +7,7 @@ on:
 
 env:
   DOCKER_BUILDKIT: 1
+  BENCHMARK_REGISTRY: quay.io/chengyuzhu6
 
 jobs:
   build:

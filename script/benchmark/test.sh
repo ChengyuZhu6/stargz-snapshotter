@@ -66,17 +66,31 @@ trap 'cleanup "$?"' EXIT SIGHUP SIGINT SIGQUIT SIGTERM
 
 cp -R "${BENCHMARKING_TARGET_CONFIG_DIR}" "${TMP_CONTEXT}/config"
 
+# 获取主机IP地址，用于容器访问host上的registry
+HOST_IP=$(hostname -I | awk '{print $1}')
+REGISTRY_PORT=${REGISTRY_PORT:-443}
+REGISTRY_ADDR="${BENCHMARK_REGISTRY}:${REGISTRY_PORT}"
+
 cat <<EOF > "${TMP_CONTEXT}/Dockerfile"
 FROM ${BENCHMARKING_BASE_IMAGE_NAME}
 
 RUN apt-get update -y && \
-    apt-get install -y python3 jq wget && \
+    apt-get install -y python3 jq wget ca-certificates openssl && \
     ln -s /usr/bin/python3 /usr/bin/python && \
     mkdir -p /tmp/crane && \
     wget -O - https://github.com/google/go-containerregistry/releases/download/v0.19.1/go-containerregistry_Linux_x86_64.tar.gz | tar -C /tmp/crane/ -zxf - && \
     mv /tmp/crane/crane /usr/local/bin/
 
 COPY ./config /
+
+# # 创建证书目录
+# RUN mkdir -p /etc/docker/certs.d/${BENCHMARK_REGISTRY} /usr/local/share/ca-certificates/${BENCHMARK_REGISTRY} && \
+#     mkdir -p /etc/containerd/certs.d/${BENCHMARK_REGISTRY} && \
+#     echo 'server = "https://${BENCHMARK_REGISTRY}:${REGISTRY_PORT}"' > /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml && \
+#     echo '' >> /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml && \
+#     echo '[host."https://${BENCHMARK_REGISTRY}:${REGISTRY_PORT}"]' >> /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml && \
+#     echo '  skip_verify = true' >> /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml
+
 
 ENV CONTAINERD_SNAPSHOTTER=""
 
@@ -93,6 +107,7 @@ services:
     container_name: ${BENCHMARKING_CONTAINER}
     privileged: true
     init: true
+    network_mode: "host"
     working_dir: /go/src/github.com/containerd/stargz-snapshotter
     environment:
     - NO_PROXY=127.0.0.1,localhost
@@ -100,6 +115,8 @@ services:
     - HTTPS_PROXY=${HTTPS_PROXY:-}
     - http_proxy=${http_proxy:-}
     - https_proxy=${https_proxy:-}
+    - REGISTRY_PORT=${REGISTRY_PORT}
+    - INSECURE_REGISTRY=${INSECURE_REGISTRY:-true}
     tmpfs:
     - /tmp:exec,mode=777
     volumes:
@@ -109,6 +126,12 @@ services:
     - "containerd-stargz-grpc-data:/var/lib/containerd-stargz-grpc:delegated"
     - "containers-data:/var/lib/containers:delegated"
     - "additional-store-data:/var/lib/stargz-store:delegated"
+    # 如果有证书文件，可以挂载
+    # - "/usr/local/share/ca-certificates/${BENCHMARK_REGISTRY}.crt:/etc/docker/certs.d/${BENCHMARK_REGISTRY}/ca.crt:ro"
+    # - "/usr/local/share/ca-certificates/${BENCHMARK_REGISTRY}.crt:/etc/containerd/certs.d/${BENCHMARK_REGISTRY}/ca.crt:ro"
+    # 添加host映射，确保容器可以解析registry主机名
+    extra_hosts:
+    - "${BENCHMARK_REGISTRY}:${HOST_IP}"
 volumes:
   containerd-data:
   containerd-stargz-grpc-data:
@@ -137,8 +160,24 @@ if ! ( cd "${CONTEXT}" && \
            docker compose -f "${DOCKER_COMPOSE_YAML}" build ${DOCKER_BUILD_ARGS:-} \
                           "${BENCHMARKING_NODE}" && \
            docker compose -f "${DOCKER_COMPOSE_YAML}" up -d --force-recreate && \
+           # 配置容器内部信任私有registry证书
+        #    docker exec -i "${BENCHMARKING_CONTAINER}" bash -c "if [ -f /etc/docker/certs.d/${BENCHMARK_REGISTRY}/ca.crt ]; then 
+        #        cp /etc/docker/certs.d/${BENCHMARK_REGISTRY}/ca.crt /usr/local/share/ca-certificates/${BENCHMARK_REGISTRY}.crt && 
+        #        cp /etc/docker/certs.d/${BENCHMARK_REGISTRY}/ca.crt /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/ca.crt && 
+        #        update-ca-certificates
+        #    else 
+        #        # 如果没有证书，配置为不安全的registry
+        #        if [ \"\${INSECURE_REGISTRY}\" = \"true\" ]; then
+        #            mkdir -p /etc/containerd/certs.d/${BENCHMARK_REGISTRY}
+        #            echo 'server = \"https://${BENCHMARK_REGISTRY}:${REGISTRY_PORT}\"' > /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml
+        #            echo '' >> /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml
+        #            echo '[host.\"https://${BENCHMARK_REGISTRY}:${REGISTRY_PORT}\"]' >> /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml
+        #            echo '  skip_verify = true' >> /etc/containerd/certs.d/${BENCHMARK_REGISTRY}/hosts.toml
+        #        fi
+        #    fi" && \
            docker exec \
-		  -e BENCHMARK_RUNTIME_MODE -e BENCHMARK_SAMPLES_NUM -e BENCHMARK_PROFILE \
+                  -e BENCHMARK_RUNTIME_MODE -e BENCHMARK_SAMPLES_NUM -e BENCHMARK_PROFILE \
+                  -e BENCHMARK_REGISTRY -e REGISTRY_PORT -e INSECURE_REGISTRY \
                   -i "${BENCHMARKING_CONTAINER}" \
                   script/benchmark/hello-bench/run.sh \
                   "${BENCHMARK_REGISTRY}" \

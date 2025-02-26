@@ -31,7 +31,7 @@ ARG PAUSE_IMAGE_NAME_TEST=registry.k8s.io/pause:3.10
 
 # Used in CI
 ARG CRI_TOOLS_VERSION=v1.30.0
-ARG BENCHMARK_REGISTRY=docker.io/library
+ARG BENCHMARK_REGISTRY=${BENCHMARK_REGISTRY:-docker.io/library}
 
 # Legacy builder that doesn't support TARGETARCH should set this explicitly using --build-arg.
 # If TARGETARCH isn't supported by the builder, the default value is "amd64".

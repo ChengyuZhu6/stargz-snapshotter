@@ -15,7 +15,7 @@ jobs:
     env:
       BENCHMARK_LOG_DIR: ${{ github.workspace }}/log/
       BENCHMARK_RESULT_DIR: ${{ github.workspace }}/benchmark/
-      BENCHMARK_REGISTRY: ${{ vars.REGISTRY }}
+      BENCHMARK_REGISTRY: quay.io/chengyuzhu6
       BENCHMARK_TARGETS: ""
       BENCHMARK_SAMPLES_NUM: 5
       BENCHMARK_PERCENTILE: 95
@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        runtime: ["podman"]
+        runtime: ["containerd"]
     steps:
     - name: Install tools
       run: |
