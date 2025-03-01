@@ -77,7 +77,7 @@ def genargs_for_optimization(arg):
 
 def format_repo(mode, repository, name):
     if mode == ESTARGZ_MODE:
-        return "%s/%s-esgz" % (repository, name)
+        return "%s/%s-estargz" % (repository, name)
     elif mode == ESTARGZ_NOOPT_MODE:
         return "%s/%s-esgz-noopt" % (repository, name)
     elif mode == ZSTDCHUNKED_MODE:
@@ -411,9 +411,9 @@ class ContainerdController:
         self.is_lazypull = is_lazypull
 
     def pull_cmd(self, image):
-        base_cmd = "%s i pull" % CTR
+        base_cmd = "%s i pull " % CTR
         if self.is_lazypull:
-            base_cmd = "ctr-remote i rpull"
+            base_cmd = "ctr-remote i rpull "
         cmd = '%s %s' % (base_cmd, image)
         print (cmd)
         return cmd

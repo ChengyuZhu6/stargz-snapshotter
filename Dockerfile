@@ -31,11 +31,12 @@ ARG PAUSE_IMAGE_NAME_TEST=registry.k8s.io/pause:3.10
 
 # Used in CI
 ARG CRI_TOOLS_VERSION=v1.30.0
+ARG BENCHMARK_REGISTRY=${BENCHMARK_REGISTRY:-docker.io/library}
 
 # Legacy builder that doesn't support TARGETARCH should set this explicitly using --build-arg.
 # If TARGETARCH isn't supported by the builder, the default value is "amd64".
 
-FROM golang:1.23-bullseye AS golang-base
+FROM $BENCHMARK_REGISTRY/golang:1.23-bullseye AS golang-base
 
 # Build containerd
 FROM golang-base AS containerd-dev
@@ -70,7 +71,7 @@ RUN apt-get update -y && apt-get install -y libbtrfs-dev libseccomp-dev && \
     make vendor && make && DESTDIR=/out/ PREFIX= make install
 
 # Build runc
-FROM golang:1.23-bullseye AS runc-dev
+FROM $BENCHMARK_REGISTRY/golang:1.23-bullseye AS runc-dev
 ARG RUNC_VERSION
 RUN apt-get update -y && apt-get install -y libseccomp-dev && \
     git clone -b ${RUNC_VERSION} --depth 1 \
@@ -112,7 +113,7 @@ RUN apt-get update -y && apt-get install -y libseccomp-dev libgpgme-dev && \
 
 # Build CRI-O
 # FROM golang-base AS cri-o-dev
-FROM golang:1.23-bullseye AS cri-o-dev
+FROM $BENCHMARK_REGISTRY/golang:1.23-bullseye AS cri-o-dev
 ARG CRIO_VERSION
 RUN apt-get update -y && apt-get install -y libseccomp-dev libgpgme-dev && \
     git clone https://github.com/cri-o/cri-o $GOPATH/src/github.com/cri-o/cri-o && \
@@ -172,7 +173,7 @@ COPY --from=snapshotter-dev /out/ctr-remote /usr/local/bin/
 RUN ln -s /usr/local/bin/ctr-remote /usr/local/bin/ctr
 
 # Base image which contains podman with stargz-store
-FROM ubuntu:24.04 AS podman-base
+FROM $BENCHMARK_REGISTRY/ubuntu:24.04 AS podman-base
 ARG TARGETARCH
 ARG CNI_PLUGINS_VERSION
 ARG PODMAN_VERSION
@@ -255,7 +256,7 @@ ENTRYPOINT [ "/usr/local/bin/kind-entrypoint.sh", "/usr/local/bin/entrypoint", "
 
 # Image for testing CRI-O with Stargz Store.
 # NOTE: This cannot be used for the node image of KinD.
-FROM ubuntu:24.04 AS crio-stargz-store
+FROM $BENCHMARK_REGISTRY/ubuntu:24.04 AS crio-stargz-store
 ARG CNI_PLUGINS_VERSION
 ARG CRIO_TEST_PAUSE_IMAGE_NAME
 ENV container docker
@@ -287,7 +288,7 @@ COPY ./script/config-cri-o/ /
 ENTRYPOINT [ "/usr/local/bin/entrypoint" ]
 
 # Image which can be used as a node image for KinD
-FROM kindest/node:v1.30.0
+FROM $BENCHMARK_REGISTRY/kindest/node:v1.30.0
 COPY --from=containerd-dev /out/bin/containerd /out/bin/containerd-shim-runc-v2 /usr/local/bin/
 COPY --from=snapshotter-dev /out/* /usr/local/bin/
 COPY ./script/config/ /

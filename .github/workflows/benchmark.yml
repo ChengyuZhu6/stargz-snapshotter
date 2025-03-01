@@ -10,14 +10,13 @@ env:
 
 jobs:
   hello-bench:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux]
     name: HelloBench
     env:
       BENCHMARK_LOG_DIR: ${{ github.workspace }}/log/
       BENCHMARK_RESULT_DIR: ${{ github.workspace }}/benchmark/
-      BENCHMARK_REGISTRY: ghcr.io
-      BENCHMARK_USER: stargz-containers
-      BENCHMARK_TARGETS: python:3.10 gcc:11.2.0 postgres:14.2 tomcat:10.1.0-jdk17-openjdk-bullseye
+      BENCHMARK_REGISTRY: quay.io/chengyuzhu6
+      BENCHMARK_TARGETS: ""
       BENCHMARK_SAMPLES_NUM: 5
       BENCHMARK_PERCENTILE: 95
       BENCHMARK_PERCENTILES_GRANULARITY: 25
@@ -25,20 +24,40 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        runtime: ["podman", "containerd"]
+        runtime: ["containerd"]
     steps:
     - name: Install tools
       run: |
           sudo apt-get update && \
-          sudo apt-get install -y gnuplot python3-numpy
+          sudo apt-get install -y gnuplot python3-numpy yq
     - uses: actions/checkout@v4
     - name: Prepare directories
       run: mkdir "${BENCHMARK_RESULT_DIR}" "${BENCHMARK_LOG_DIR}"
-    - name: Get instance information
+    - name: Get system information
       run: |
-          curl -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2019-11-01" | \
-          jq '{ location : .compute.location, vmSize : .compute.vmSize }' | \
-          tee ${{ env.BENCHMARK_RESULT_DIR }}/instance.json
+          bash script/util/system_info.sh | \
+          tee ${{ env.BENCHMARK_RESULT_DIR }}/system_info.json
+    - name: Get test images
+      run: |
+        # 显示文件内容以确保文件存在且可读
+        echo "Content of image_names.yaml:"
+        cat script/benchmark/image_names.yaml
+        
+        # 使用 yq 读取并存储到变量中
+        IMAGES=$(yq -r '.images[]' script/benchmark/image_names.yaml | tr '\n' ' ' | sed 's/ $//')
+        
+        # 显示读取到的镜像列表
+        echo "Images found: ${IMAGES}"
+        
+        # 设置到 GITHUB_ENV
+        echo "BENCHMARK_TARGETS=${IMAGES}" >> $GITHUB_ENV
+        
+        # 验证环境变量是否设置成功
+        echo "BENCHMARK_TARGETS from env: $BENCHMARK_TARGETS"
+        
+        # 显示 GITHUB_ENV 文件内容
+        echo "Content of GITHUB_ENV:"
+        cat $GITHUB_ENV
     - name: Run benchmark
       env:
         BENCHMARK_RUNTIME_MODE: ${{ matrix.runtime }}
