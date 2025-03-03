@@ -71,6 +71,10 @@ const (
 	BackgroundFetchDownload   = "background_fetch_download"
 	BackgroundFetchDecompress = "background_fetch_decompress"
 	PrefetchSize              = "prefetch_size"
+
+	// Write operation metrics
+	WriteOperation      = "write"
+	WriteOperationCount = "write_count"
 )
 
 var (

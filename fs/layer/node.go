@@ -484,6 +484,138 @@ func (f *file) InitFd(fd int) {
 	f.fd = fd
 }
 
+// Implement FileWriter interface for file
+var _ = (fusefs.FileWriter)((*file)(nil))
+
+func (f *file) Write(ctx context.Context, data []byte, off int64) (written uint32, errno syscall.Errno) {
+	// Measure write latency
+	start := time.Now()
+	defer commonmetrics.MeasureLatencyInMicroseconds(commonmetrics.WriteOperation, f.n.fs.layerDigest, start)
+	defer commonmetrics.IncOperationCount(commonmetrics.WriteOperationCount, f.n.fs.layerDigest)
+
+	log.G(ctx).WithFields(log.Fields{
+		"file_id": f.n.id,
+		"offset":  off,
+		"size":    len(data),
+		"fd":      f.fd,
+	}).Debug("file.Write: starting write operation")
+
+	// If we have a passthrough fd, use it for better performance
+	if f.fd > 0 {
+		log.G(ctx).Debug("file.Write: using passthrough fd")
+		n, err := unix.Pwrite(f.fd, data, off)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("file.Write: passthrough write failed")
+			f.n.fs.s.report(fmt.Errorf("file.Write (passthrough): %v", err))
+			return 0, syscall.EIO
+		}
+		log.G(ctx).WithField("bytes_written", n).Debug("file.Write: passthrough write successful")
+		return uint32(n), 0
+	}
+
+	// Otherwise, check if the underlying reader supports writing
+	if writer, ok := f.ra.(io.WriterAt); ok {
+		log.G(ctx).Debug("file.Write: using WriterAt interface")
+		n, err := writer.WriteAt(data, off)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("file.Write: WriterAt failed")
+			f.n.fs.s.report(fmt.Errorf("file.Write: %v", err))
+			return 0, syscall.EIO
+		}
+
+		// Update file size if needed
+		newSize := off + int64(n)
+		oldSize := f.n.attr.Size
+		log.G(ctx).WithFields(log.Fields{
+			"old_size":      oldSize,
+			"new_size":      newSize,
+			"bytes_written": n,
+		}).Debug("file.Write: checking if file size needs update")
+
+		if newSize > int64(oldSize) {
+			log.G(ctx).WithFields(log.Fields{
+				"old_size": oldSize,
+				"new_size": newSize,
+			}).Debug("file.Write: updating file size")
+			f.n.attr.Size = int64(newSize)
+		}
+
+		log.G(ctx).WithField("bytes_written", n).Debug("file.Write: write successful")
+		return uint32(n), 0
+	}
+
+	log.G(ctx).Error("file.Write: underlying reader doesn't support writing")
+	// If we get here, the underlying reader doesn't support writing
+	return 0, syscall.ENOTSUP
+}
+
+// Implement NodeWriter interface for node
+var _ = (fusefs.NodeWriter)((*node)(nil))
+
+func (n *node) Write(ctx context.Context, f fusefs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	log.G(ctx).WithFields(log.Fields{
+		"node_id": n.id,
+		"offset":  off,
+		"size":    len(data),
+	}).Debug("node.Write: starting write operation")
+
+	// If we have a file handle, use it
+	if fh, ok := f.(*file); ok {
+		log.G(ctx).Debug("node.Write: using existing file handle")
+		return fh.Write(ctx, data, off)
+	}
+
+	// Otherwise, open the file and write to it
+	log.G(ctx).Debug("node.Write: opening file")
+	ra, err := n.fs.r.OpenFile(n.id)
+	if err != nil {
+		log.G(ctx).WithError(err).Error("node.Write: failed to open file")
+		n.fs.s.report(fmt.Errorf("node.Write: failed to open file: %v", err))
+		return 0, syscall.EIO
+	}
+
+	// Check if the reader supports writing
+	writer, ok := ra.(io.WriterAt)
+	if !ok {
+		log.G(ctx).Error("node.Write: reader doesn't support writing")
+		return 0, syscall.ENOTSUP
+	}
+
+	// Measure write latency
+	start := time.Now()
+	defer commonmetrics.MeasureLatencyInMicroseconds(commonmetrics.WriteOperation, n.fs.layerDigest, start)
+	defer commonmetrics.IncOperationCount(commonmetrics.WriteOperationCount, n.fs.layerDigest)
+
+	// Perform the write
+	log.G(ctx).Debug("node.Write: performing write operation")
+	written, err := writer.WriteAt(data, off)
+	if err != nil {
+		log.G(ctx).WithError(err).Error("node.Write: write failed")
+		n.fs.s.report(fmt.Errorf("node.Write: %v", err))
+		return 0, syscall.EIO
+	}
+
+	// Update file size if needed
+	newSize := off + int64(written)
+	oldSize := n.attr.Size
+	log.G(ctx).WithFields(log.Fields{
+		"old_size":      oldSize,
+		"new_size":      newSize,
+		"bytes_written": written,
+	}).Debug("node.Write: checking if file size needs update")
+
+	if newSize > int64(oldSize) {
+		log.G(ctx).WithFields(log.Fields{
+			"old_size": oldSize,
+			"new_size": newSize,
+		}).Debug("node.Write: updating file size")
+		n.attr.Size = int64(newSize)
+	}
+
+	log.G(ctx).WithField("bytes_written", written).Debug("node.Write: write successful")
+	return uint32(written), 0
+}
+
 // whiteout is a whiteout abstraction compliant to overlayfs.
 type whiteout struct {
 	fusefs.Inode
