@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"os"
 	"path"
@@ -895,6 +896,8 @@ func (fr *file) ChunkEntryForOffset(offset int64) (off int64, size int64, dgst, 
 		return 0, 0, "", "", false
 	}
 	ci := fr.ents[i]
+	log.Printf("cmd ChunkEntryForOffset e.ChunkOffset = %d, e.ChunkSize = %d, dgst = %s, e.Digest = %s", ci.chunkOffset, ci.chunkSize, ci.chunkDigest, ci.fileDigest)
+
 	return ci.chunkOffset, ci.chunkSize, ci.chunkDigest, ci.fileDigest, true
 }
 
