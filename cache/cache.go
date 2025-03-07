@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -381,6 +382,9 @@ func (dc *directoryCache) isClosed() bool {
 }
 
 func (dc *directoryCache) cachePath(key string) string {
+	log.Printf("cachePath key = %s", key)
+	log.Printf("cachePath key[:2] = %s", key[:2])
+	log.Printf("cachePath filepath.Join(dc.directory, key[:2], key) = %s", filepath.Join(dc.directory, key[:2], key))
 	return filepath.Join(dc.directory, key[:2], key)
 }
 

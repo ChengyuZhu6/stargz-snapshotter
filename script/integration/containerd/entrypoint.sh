@@ -464,6 +464,7 @@ else
     cat /etc/containerd-stargz-grpc/config.toml >> /tmp/config.stargz.noverify.toml
     TEST_SNAPSHOTTER_CONFIG="/tmp/config.stargz.noverify.toml"
 fi
+echo "@@@@@@"
 
 CONTAINERD_CONFIG="${TEST_CONTAINERD_CONFIG}" SNAPSHOTTER_CONFIG="${TEST_SNAPSHOTTER_CONFIG}" \
                  dump_dir "${REGISTRY_HOST}/ubuntu:sgz" "/usr" "stargz" "true" "${USR_STARGZSN_PLAIN_STARGZ}"
@@ -475,7 +476,7 @@ diff --no-dereference -qr "${USR_NORMALSN_PLAIN_STARGZ}/" "${USR_STARGZSN_PLAIN_
 # Try to pull this image from different namespace.
 ctr-remote --namespace=dummy images rpull --user "${DUMMYUSER}:${DUMMYPASS}" \
            "${REGISTRY_HOST}/ubuntu:esgz"
-
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 ############
 # Test for starting when no configuration file.
 mv /etc/containerd-stargz-grpc/config.toml /etc/containerd-stargz-grpc/config.toml_rm
