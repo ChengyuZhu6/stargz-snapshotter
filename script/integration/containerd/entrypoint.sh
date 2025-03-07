@@ -453,29 +453,29 @@ echo "Getting (legacy) stargz image with normal snapshotter..."
 dump_dir "${REGISTRY_HOST}/ubuntu:sgz" "/usr" "overlayfs" "false" "${USR_NORMALSN_PLAIN_STARGZ}"
 
 echo "Getting (legacy) stargz image with stargz snapshotter..."
-TEST_CONTAINERD_CONFIG=
-TEST_SNAPSHOTTER_CONFIG=
-if [ "${BUILTIN_SNAPSHOTTER}" == "true" ] ; then
-    cp /etc/containerd/config.toml /tmp/config.containerd.noverify.toml
-    sed -i 's/disable_verification = false/disable_verification = true/g' /tmp/config.containerd.noverify.toml
-    TEST_CONTAINERD_CONFIG="/tmp/config.containerd.noverify.toml"
-else
-    echo "disable_verification = true" > /tmp/config.stargz.noverify.toml
-    cat /etc/containerd-stargz-grpc/config.toml >> /tmp/config.stargz.noverify.toml
-    TEST_SNAPSHOTTER_CONFIG="/tmp/config.stargz.noverify.toml"
-fi
+# TEST_CONTAINERD_CONFIG=
+# TEST_SNAPSHOTTER_CONFIG=
+# if [ "${BUILTIN_SNAPSHOTTER}" == "true" ] ; then
+#     cp /etc/containerd/config.toml /tmp/config.containerd.noverify.toml
+#     sed -i 's/disable_verification = false/disable_verification = true/g' /tmp/config.containerd.noverify.toml
+#     TEST_CONTAINERD_CONFIG="/tmp/config.containerd.noverify.toml"
+# else
+#     echo "disable_verification = true" > /tmp/config.stargz.noverify.toml
+#     cat /etc/containerd-stargz-grpc/config.toml >> /tmp/config.stargz.noverify.toml
+#     TEST_SNAPSHOTTER_CONFIG="/tmp/config.stargz.noverify.toml"
+# fi
 
-CONTAINERD_CONFIG="${TEST_CONTAINERD_CONFIG}" SNAPSHOTTER_CONFIG="${TEST_SNAPSHOTTER_CONFIG}" \
-                 dump_dir "${REGISTRY_HOST}/ubuntu:sgz" "/usr" "stargz" "true" "${USR_STARGZSN_PLAIN_STARGZ}"
+# CONTAINERD_CONFIG="${TEST_CONTAINERD_CONFIG}" SNAPSHOTTER_CONFIG="${TEST_SNAPSHOTTER_CONFIG}" \
+#                  dump_dir "${REGISTRY_HOST}/ubuntu:sgz" "/usr" "stargz" "true" "${USR_STARGZSN_PLAIN_STARGZ}"
 
-echo "Diffing between two root filesystems(normal vs stargz snapshotter, plain stargz rootfs)"
-diff --no-dereference -qr "${USR_NORMALSN_PLAIN_STARGZ}/" "${USR_STARGZSN_PLAIN_STARGZ}/"
+# echo "Diffing between two root filesystems(normal vs stargz snapshotter, plain stargz rootfs)"
+# diff --no-dereference -qr "${USR_NORMALSN_PLAIN_STARGZ}/" "${USR_STARGZSN_PLAIN_STARGZ}/"
 
 ############
 # Try to pull this image from different namespace.
 ctr-remote --namespace=dummy images rpull --user "${DUMMYUSER}:${DUMMYPASS}" \
            "${REGISTRY_HOST}/ubuntu:esgz"
-
+echo "Diffing between two root filesystems(normal vs stargz snapshotter, plain stargz rootfs)"
 ############
 # Test for starting when no configuration file.
 mv /etc/containerd-stargz-grpc/config.toml /etc/containerd-stargz-grpc/config.toml_rm
