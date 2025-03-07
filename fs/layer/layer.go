@@ -176,7 +176,7 @@ func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager,
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
-
+	log.L.Printf("Resolver rootDir = %s", root)
 	return &Resolver{
 		rootDir:                 root,
 		resolver:                remote.NewResolver(cfg.BlobConfig, resolveHandlers),
@@ -193,6 +193,7 @@ func NewResolver(root string, backgroundTaskManager *task.BackgroundTaskManager,
 }
 
 func newCache(root string, cacheType string, cfg config.Config) (cache.BlobCache, error) {
+	log.L.Printf("newCache root = %s", root)
 	if cacheType == memoryCacheType {
 		return cache.NewMemoryCache(), nil
 	}
@@ -224,12 +225,12 @@ func newCache(root string, cacheType string, cfg config.Config) (cache.BlobCache
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
-	cachePath, err := os.MkdirTemp(root, "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize directory cache: %w", err)
-	}
+	// cachePath, err := os.MkdirTemp(root, "")
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to initialize directory cache: %w", err)
+	// }
 	return cache.NewDirectoryCache(
-		cachePath,
+		root,
 		cache.DirectoryCacheConfig{
 			SyncAdd:   dcc.SyncAdd,
 			DataCache: dCache,

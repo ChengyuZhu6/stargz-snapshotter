@@ -26,7 +26,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -526,30 +528,54 @@ func positive(n int64) int64 {
 	}
 	return n
 }
+func printStack() {
+	pcs := make([]uintptr, 10)   // 10 is the number of stack frames to capture
+	n := runtime.Callers(2, pcs) // Skip 2 frames (printStack and caller)
+	pcs = pcs[:n]
+
+	for _, pc := range pcs {
+		fn := runtime.FuncForPC(pc)
+		file, line := fn.FileLine(pc)
+		fmt.Printf("%s:%d %s\n", file, line, fn.Name())
+	}
+}
+
+func CustomPrint(v ...interface{}) {
+	_, file, line, ok := runtime.Caller(1)
+	if ok {
+		fmt.Printf("********** [debug] %s:%d: ", file, line)
+	}
+	fmt.Println(fmt.Sprint(v...))
+	printStack()
+}
 
 // cacheChunkData handles caching of chunk data
 func (b *blob) cacheChunkData(chunk region, r io.Reader, fr fetcher, allData map[region]io.Writer, fetched map[region]bool, opts *options) error {
 	id := fr.genID(chunk)
+	// CustomPrint("genID")
+	log.Printf("id = %+v", id)
 	cw, err := b.cache.Add(id, opts.cacheOpts...)
+	// CustomPrint("after cache.add")
 	if err != nil {
 		return fmt.Errorf("failed to create cache writer: %w", err)
 	}
 	defer cw.Close()
-
+	// CustomPrint("before io.Writer")
 	w := io.Writer(cw)
 	if _, ok := fetched[chunk]; ok {
 		w = io.MultiWriter(w, allData[chunk])
 	}
-
+	// CustomPrint("after io.Writer")
+	log.Printf("w = %+v", w)
 	if _, err := io.CopyN(w, r, chunk.size()); err != nil {
 		cw.Abort()
 		return fmt.Errorf("failed to write chunk data: %w", err)
 	}
-
+	// CustomPrint("after io.CopyN")
 	if err := cw.Commit(); err != nil {
 		return fmt.Errorf("failed to commit chunk: %w", err)
 	}
-
+	// CustomPrint("after cw.commit")
 	b.fetchedRegionSetMu.Lock()
 	b.fetchedRegionSet.add(chunk)
 	b.fetchedRegionSetMu.Unlock()

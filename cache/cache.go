@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/containerd/stargz-snapshotter/util/cacheutil"
@@ -195,9 +197,35 @@ type directoryCache struct {
 	closedMu sync.Mutex
 }
 
+func printStack() {
+	pcs := make([]uintptr, 10)   // 10 is the number of stack frames to capture
+	n := runtime.Callers(2, pcs) // Skip 2 frames (printStack and caller)
+	pcs = pcs[:n]
+
+	for _, pc := range pcs {
+		fn := runtime.FuncForPC(pc)
+		file, line := fn.FileLine(pc)
+		fmt.Printf("%s:%d %s\n", file, line, fn.Name())
+	}
+}
+
+func CustomPrint(v ...interface{}) {
+	_, file, line, ok := runtime.Caller(1)
+	if ok {
+		fmt.Printf("********** [debug] %s:%d: ", file, line)
+	}
+	fmt.Println(fmt.Sprint(v...))
+	printStack()
+}
+
 func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	if dc.isClosed() {
 		return nil, fmt.Errorf("cache is already closed")
+	}
+
+	// Validate key
+	if key == "" {
+		return nil, fmt.Errorf("empty key is not allowed")
 	}
 
 	opt := &cacheOpt{}
@@ -230,9 +258,9 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	}
 
 	// Open the cache file and read the target region
-	// TODO: If the target cache is write-in-progress, should we wait for the completion
-	//       or simply report the cache miss?
-	file, err := os.Open(dc.cachePath(key))
+	cachePath := dc.cachePath(key)
+	log.Printf("directoryCache Get dc.cachePath(key) = %s", cachePath)
+	file, err := os.Open(cachePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
 	}
@@ -276,11 +304,27 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		return nil, fmt.Errorf("cache is already closed")
 	}
 
+	// Validate key
+	if key == "" {
+		return nil, fmt.Errorf("empty key is not allowed")
+	}
+
+	cachePath := dc.cachePath(key)
+	CustomPrint("cachePath", cachePath)
+	// Check whether the file exists
+	_, err := os.Stat(cachePath)
+	log.Printf("err = %s", err)
+	if os.IsExist(err) {
+		return nil, fmt.Errorf("cache file for %q does exist", key)
+	}
+	// CustomPrint("opts")
+	log.Printf("opts = %+v", opts)
 	opt := &cacheOpt{}
 	for _, o := range opts {
 		opt = o(opt)
 	}
-
+	log.Printf("opt = %+v", opt)
+	// CustomPrint("opt")
 	wip, err := dc.wipFile(key)
 	if err != nil {
 		return nil, err
@@ -292,16 +336,27 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				return fmt.Errorf("cache is already closed")
 			}
 			// Commit the cache contents
-			c := dc.cachePath(key)
-			if err := os.MkdirAll(filepath.Dir(c), os.ModePerm); err != nil {
+			cachePath := dc.cachePath(key)
+			log.Printf("directoryCache Add dc.cachePath(key) = %s", cachePath)
+			log.Printf("directoryCache Add c = %s", cachePath)
+
+			// Ensure the directory exists
+			cacheDir := filepath.Dir(cachePath)
+			if err := os.MkdirAll(cacheDir, os.ModePerm); err != nil {
 				var errs []error
 				if err := os.Remove(wip.Name()); err != nil {
 					errs = append(errs, err)
 				}
-				errs = append(errs, fmt.Errorf("failed to create cache directory %q: %w", c, err))
+				errs = append(errs, fmt.Errorf("failed to create cache directory %q: %w", cacheDir, err))
 				return errors.Join(errs...)
 			}
-			return os.Rename(wip.Name(), c)
+			log.Printf("Ensure the directory exists = %s", cacheDir)
+			// Perform the rename
+			if err := os.Rename(wip.Name(), cachePath); err != nil {
+				return fmt.Errorf("failed to rename cache file: %w", err)
+			}
+			log.Printf("Rename cache file = %s", cachePath)
+			return nil
 		},
 		abortFunc: func() error {
 			return os.Remove(wip.Name())
@@ -323,10 +378,14 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				w.Close()
 				return fmt.Errorf("cache is already closed")
 			}
+			log.Printf("cached, done, added := dc.cache.Add(key, b)")
+			// CustomPrint("memW")
 			cached, done, added := dc.cache.Add(key, b)
+			log.Printf("cached, added = %+v", added)
 			if !added {
 				dc.putBuffer(b) // already exists in the cache. abort it.
 			}
+			log.Printf("commit := func() error {")
 			commit := func() error {
 				defer done()
 				defer w.Close()
@@ -337,14 +396,17 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				}
 				return w.Commit()
 			}
+			// CustomPrint("dc.syncAdd")
 			if dc.syncAdd {
 				return commit()
 			}
 			go func() {
+				// CustomPrint("commit to file")
 				if err := commit(); err != nil {
 					fmt.Println("failed to commit to file:", err)
 				}
 			}()
+			// CustomPrint("successful")
 			return nil
 		},
 		abortFunc: func() error {
@@ -381,7 +443,21 @@ func (dc *directoryCache) isClosed() bool {
 }
 
 func (dc *directoryCache) cachePath(key string) string {
-	return filepath.Join(dc.directory, key[:2], key)
+	log.Printf("cachePath key = %s", key)
+	log.Printf("dc.directory = %s", dc.directory)
+	// Check if key has at least 2 characters before slicing
+	var prefix string
+	if len(key) >= 2 {
+		prefix = key[:2]
+		log.Printf("cachePath key[:2] = %s", prefix)
+	} else {
+		prefix = key
+		log.Printf("cachePath using full key as prefix = %s", prefix)
+	}
+
+	path := filepath.Join(dc.directory, prefix, key)
+	log.Printf("cachePath filepath.Join(dc.directory, prefix, key) = %s", path)
+	return path
 }
 
 func (dc *directoryCache) wipFile(key string) (*os.File, error) {
@@ -462,4 +538,12 @@ func (w *writeCloser) Close() error { return w.closeFunc() }
 
 func nopWriteCloser(w io.Writer) io.WriteCloser {
 	return &writeCloser{w, func() error { return nil }}
+}
+
+// Helper function for min
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }

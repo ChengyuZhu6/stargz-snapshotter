@@ -874,8 +874,8 @@ func (c *mockCache) Close() error {
 
 type mockFile struct{}
 
-func (f *mockFile) ChunkEntryForOffset(offset int64) (off int64, size int64, dgst string, ok bool) {
-	return 0, 0, "", true
+func (f *mockFile) ChunkEntryForOffset(offset int64) (off int64, size int64, dgst string, fileDigest string, ok bool) {
+	return 0, 0, "", "", true
 }
 
 func (f *mockFile) ReadAt(p []byte, offset int64) (int, error) {
