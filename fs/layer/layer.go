@@ -516,7 +516,7 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 		}
 		// override the prefetch size with optimized value
 		prefetchSize = offset
-		digest, err = l.verifiableReader.Metadata().GetDigest(id, false)
+		digest, err = l.verifiableReader.Metadata().GetDigest(id, true)
 		if err != nil {
 			return fmt.Errorf("failed to get digest of prefetch landmark: %w", err)
 		}
