@@ -141,6 +141,7 @@ function reboot_containerd {
 }
 
 function optimize {
+    echo "before optimize..."
     local SRC="${1}"
     local DST="${2}"
     local PLAINHTTP="${3}"
@@ -152,9 +153,11 @@ function optimize {
         PUSHOPTS=--plain-http
     fi
     ctr-remote image push --local ${PUSHOPTS} -u "${DUMMYUSER}:${DUMMYPASS}" "${DST}"
+    echo "after optimize..."
 }
 
 function convert {
+    echo "before convert..."
     local SRC="${1}"
     local DST="${2}"
     local PLAINHTTP="${3}"
@@ -166,17 +169,21 @@ function convert {
     ctr-remote image pull --local -u "${DUMMYUSER}:${DUMMYPASS}" "${SRC}"
     ctr-remote image convert ${OPTS} --oci "${SRC}" "${DST}"
     ctr-remote image push --local ${PUSHOPTS} -u "${DUMMYUSER}:${DUMMYPASS}" "${DST}"
+    echo "after convert..."
 }
 
 function copy {
+    echo "before copy..."
     local SRC="${1}"
     local DST="${2}"
     ctr-remote image pull --local --all-platforms "${SRC}"
     ctr-remote image tag --local "${SRC}" "${DST}"
     ctr-remote image push --local -u "${DUMMYUSER}:${DUMMYPASS}" "${DST}"
+    echo "after copy..."
 }
 
 function copy_out_dir {
+    echo "before copy_out_dir..."
     local IMAGE="${1}"
     local TARGETDIR="${2}"
     local DEST="${3}"
@@ -189,9 +196,11 @@ function copy_out_dir {
     tar -C "${DEST}" -xf "${TMPFILE}"
     ctr-remote c rm "${UNIQUE}" || true
     rm "${TMPFILE}"
+    echo "after copy_out_dir..."
 }
 
 function dump_dir {
+    echo "before dump_dir..."
     local IMAGE="${1}"
     local TARGETDIR="${2}"
     local SNAPSHOTTER="${3}"
@@ -205,12 +214,16 @@ function dump_dir {
         ctr-remote image pull --local --snapshotter="${SNAPSHOTTER}" --user "${DUMMYUSER}:${DUMMYPASS}" "${IMAGE}"
     fi
     copy_out_dir "${IMAGE}" "${TARGETDIR}" "${DEST}" "${SNAPSHOTTER}"
+    echo "after dump_dir..."
 }
 
 function run_and_check_remote_snapshots {
+    echo "before run_and_check_remote_snapshots..."
     echo -n "" > "${LOG_FILE}"
     ${@:1}
+    echo "before check_remote_snapshots..."
     check_remote_snapshots "${LOG_FILE}"
+    echo "after run_and_check_remote_snapshots..."
 }
 
 # Copied from moby project (Apache License 2.0)
@@ -333,7 +346,14 @@ ctr-remote image pull --local --user "${DUMMYUSER}:${DUMMYPASS}" "${REGISTRY_HOS
 copy_out_dir "${REGISTRY_HOST}/alpine:esgz" "/usr" "${USR_ORG}" "overlayfs"
 
 echo "Getting image with stargz snapshotter..."
-run_and_check_remote_snapshots ctr-remote images rpull --user "${DUMMYUSER}:${DUMMYPASS}" "${REGISTRY_HOST}/alpine:esgz"
+# run_and_check_remote_snapshots ctr-remote images rpull --user "${DUMMYUSER}:${DUMMYPASS}" "${REGISTRY_HOST}/alpine:esgz"
+ctr-remote --debug images rpull --user "${DUMMYUSER}:${DUMMYPASS}" "${REGISTRY_HOST}/alpine:esgz"
+LOG_REMOTE_SNAPSHOT="remote-snapshot-prepared"
+REMOTE=$(jq -r 'select(."'"${LOG_REMOTE_SNAPSHOT}"'" == "true")' "${LOG_FILE}" | wc -l)
+LOCAL=$(jq -r 'select(."'"${LOG_REMOTE_SNAPSHOT}"'" == "false")' "${LOG_FILE}" | wc -l)
+echo "REMOTE: ${REMOTE}"
+echo "LOCAL: ${LOCAL}"
+echo "after run_and_check_remote_snapshots..."
 
 REGISTRY_HOST_IP=$(getent hosts "${REGISTRY_HOST}" | awk '{ print $1 }')
 REGISTRY_ALT_HOST_IP=$(getent hosts "${REGISTRY_ALT_HOST}" | awk '{ print $1 }')
@@ -475,7 +495,6 @@ diff --no-dereference -qr "${USR_NORMALSN_PLAIN_STARGZ}/" "${USR_STARGZSN_PLAIN_
 # Try to pull this image from different namespace.
 ctr-remote --namespace=dummy images rpull --user "${DUMMYUSER}:${DUMMYPASS}" \
            "${REGISTRY_HOST}/ubuntu:esgz"
-
 ############
 # Test for starting when no configuration file.
 mv /etc/containerd-stargz-grpc/config.toml /etc/containerd-stargz-grpc/config.toml_rm

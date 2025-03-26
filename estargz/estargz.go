@@ -222,6 +222,7 @@ func (r *Reader) initFields() error {
 		}
 		if ent.Type == "chunk" {
 			ent.Name = lastPath
+			ent.Digest = lastRegEnt.Digest
 			r.chunks[ent.Name] = append(r.chunks[ent.Name], ent)
 			if ent.ChunkSize == 0 && lastRegEnt != nil {
 				ent.ChunkSize = lastRegEnt.Size - ent.ChunkOffset
