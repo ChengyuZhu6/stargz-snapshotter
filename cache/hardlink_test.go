@@ -17,6 +17,8 @@
 package cache
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -51,13 +53,20 @@ func setupTestEnvironment(t *testing.T) (string, string, string, *HardlinkManage
 	return tmpDir, sourceDir, sourceFile, hlm
 }
 
+// Helper function to generate a digest for testing
+func generateTestDigest(content string) string {
+	hash := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("sha256:%x", hash)
+}
+
 // Test CreateLink functionality
 func TestHardlinkManager_CreateLink(t *testing.T) {
 	_, _, sourceFile, hlm := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
 
 	t.Run("Success", func(t *testing.T) {
 		key := "test-key"
-		if err := hlm.CreateLink(key, sourceFile); err != nil {
+		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
 			t.Fatalf("CreateLink failed: %v", err)
 		}
 
@@ -67,7 +76,7 @@ func TestHardlinkManager_CreateLink(t *testing.T) {
 			t.Fatal("link should exist")
 		}
 
-		// Verify hardlink
+		// Verify file
 		sourceStat, err := os.Stat(sourceFile)
 		if err != nil {
 			t.Fatalf("failed to stat source: %v", err)
@@ -77,12 +86,12 @@ func TestHardlinkManager_CreateLink(t *testing.T) {
 			t.Fatalf("failed to stat link: %v", err)
 		}
 		if !os.SameFile(sourceStat, linkStat) {
-			t.Fatal("should hardlink files")
+			t.Fatal("files should reference the same inode")
 		}
 	})
 
 	t.Run("NonExistentSource", func(t *testing.T) {
-		err := hlm.CreateLink("bad-key", "nonexistent")
+		err := hlm.CreateLink("bad-key", "nonexistent", testDigest)
 		if err == nil {
 			t.Fatal("should fail with nonexistent source")
 		}
@@ -92,10 +101,11 @@ func TestHardlinkManager_CreateLink(t *testing.T) {
 // Test GetLink functionality
 func TestHardlinkManager_GetLink(t *testing.T) {
 	_, _, sourceFile, hlm := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
 
 	t.Run("ExistingLink", func(t *testing.T) {
 		key := "get-test"
-		if err := hlm.CreateLink(key, sourceFile); err != nil {
+		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
 			t.Fatalf("CreateLink failed: %v", err)
 		}
 
@@ -119,6 +129,7 @@ func TestHardlinkManager_GetLink(t *testing.T) {
 // Test cleanup functionality
 func TestHardlinkManager_Cleanup(t *testing.T) {
 	tmpDir, _, sourceFile, _ := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
 
 	cleanupDir := filepath.Join(tmpDir, "cleanup")
 	cleanupHLM, err := NewHardlinkManager(cleanupDir)
@@ -132,9 +143,9 @@ func TestHardlinkManager_Cleanup(t *testing.T) {
 		os.RemoveAll(cleanupDir)
 	})
 
-	t.Run("ExpiredLink", func(t *testing.T) {
+	t.Run("UnusedDigest", func(t *testing.T) {
 		key := "cleanup-test"
-		if err := cleanupHLM.CreateLink(key, sourceFile); err != nil {
+		if err := cleanupHLM.CreateLink(key, sourceFile, testDigest); err != nil {
 			t.Fatalf("CreateLink failed: %v", err)
 		}
 
@@ -143,9 +154,10 @@ func TestHardlinkManager_Cleanup(t *testing.T) {
 			t.Fatalf("failed to persist: %v", err)
 		}
 
-		// Set link as expired
+		// Remove key to create unused digest
 		cleanupHLM.mu.Lock()
-		cleanupHLM.links[key].LastUsed = time.Now().Add(-31 * 24 * time.Hour)
+		delete(cleanupHLM.keyToDigest, key)
+		cleanupHLM.digestToKeys[testDigest].Keys = []string{}
 		cleanupHLM.mu.Unlock()
 
 		// Run cleanup with timeout
@@ -163,8 +175,11 @@ func TestHardlinkManager_Cleanup(t *testing.T) {
 		}
 
 		// Verify cleanup
-		if _, exists := cleanupHLM.GetLink(key); exists {
-			t.Fatal("expired link should be cleaned up")
+		cleanupHLM.mu.RLock()
+		_, exists := cleanupHLM.digestToFile[testDigest]
+		cleanupHLM.mu.RUnlock()
+		if exists {
+			t.Fatal("unused digest should be cleaned up")
 		}
 	})
 }
@@ -172,10 +187,11 @@ func TestHardlinkManager_Cleanup(t *testing.T) {
 // Test persistence and restoration
 func TestHardlinkManager_PersistRestore(t *testing.T) {
 	tmpDir, _, sourceFile, hlm := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
 
 	t.Run("PersistAndRestore", func(t *testing.T) {
 		key := "persist-test"
-		if err := hlm.CreateLink(key, sourceFile); err != nil {
+		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
 			t.Fatalf("CreateLink failed: %v", err)
 		}
 
@@ -202,7 +218,7 @@ func TestHardlinkManager_PersistRestore(t *testing.T) {
 			t.Fatal("link should be restored")
 		}
 
-		// Verify hardlink validity
+		// Verify file validity
 		sourceStat, err := os.Stat(sourceFile)
 		if err != nil {
 			t.Fatalf("failed to stat source: %v", err)
@@ -212,7 +228,7 @@ func TestHardlinkManager_PersistRestore(t *testing.T) {
 			t.Fatalf("failed to stat link: %v", err)
 		}
 		if !os.SameFile(sourceStat, linkStat) {
-			t.Fatal("should hardlink restored files")
+			t.Fatal("files should reference the same inode")
 		}
 	})
 }
@@ -220,6 +236,7 @@ func TestHardlinkManager_PersistRestore(t *testing.T) {
 // Test concurrent operations
 func TestHardlinkManager_Concurrent(t *testing.T) {
 	_, _, sourceFile, hlm := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
 
 	done := make(chan bool)
 	timeout := time.After(10 * time.Second)
@@ -233,7 +250,7 @@ func TestHardlinkManager_Concurrent(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			hlm.CreateLink("test-key"+string(rune(i)), sourceFile)
+			hlm.CreateLink("test-key"+string(rune(i)), sourceFile, testDigest)
 		}
 		done <- true
 	}()
