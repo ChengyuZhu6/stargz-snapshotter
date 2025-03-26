@@ -147,6 +147,17 @@ func (r *reader) GetOffset(id uint32) (offset int64, err error) {
 	return e.Offset, nil
 }
 
+func (r *reader) GetDigest(id uint32, isChunk bool) (digest string, err error) {
+	e, ok := r.idMap[id]
+	if !ok {
+		return "", fmt.Errorf("entry %d not found", id)
+	}
+	if isChunk {
+		return e.ChunkDigest, nil
+	}
+	return e.Digest, nil
+}
+
 func (r *reader) GetAttr(id uint32) (attr metadata.Attr, err error) {
 	e, ok := r.idMap[id]
 	if !ok {
