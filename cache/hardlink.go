@@ -45,7 +45,7 @@ type ChunkDigestMapping struct {
 	Keys   []string `json:"keys"`
 }
 
-// HardlinkManager manages creation, recovery and cleanup of hardlinks
+// HardlinkManager manages digest-to-file mappings and key-to-digest mappings
 type HardlinkManager struct {
 	root            string
 	hlDir           string
@@ -135,7 +135,14 @@ func (hm *HardlinkManager) GetLink(key string) (string, bool) {
 	filePath, exists := hm.digestToFile[chunkdigest]
 	if !exists {
 		log.L.Debugf("Digest file not found for key %q with digest %q", key, chunkdigest)
+
+		// We need to acquire a write lock
+		hm.mu.RUnlock()
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
 		delete(hm.keyToDigest, key)
+		hm.dirty = true
 		return "", false
 	}
 
@@ -143,7 +150,7 @@ func (hm *HardlinkManager) GetLink(key string) (string, bool) {
 	if _, err := os.Stat(filePath); err != nil {
 		log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, filePath, err)
 
-		// We'll need a write lock to remove it
+		// We need to acquire a write lock
 		hm.mu.RUnlock()
 		hm.mu.Lock()
 		defer hm.mu.Unlock()
@@ -156,27 +163,33 @@ func (hm *HardlinkManager) GetLink(key string) (string, bool) {
 	return filePath, true
 }
 
-// CreateLink creates a hardlink with retry logic
+// CreateLink registers a file as the source for a chunkdigest and maps a key to it
 func (hm *HardlinkManager) CreateLink(key string, sourcePath string, chunkdigest string) error {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	// Check if the key already exists using the reverse index
+	// Check if the key already exists
 	if _, exists := hm.keyToDigest[key]; exists {
 		return fmt.Errorf("key %q already exists in digest mapping", key)
 	}
 
-	// Add debug info about source file
+	// Verify the source file exists
 	if _, err := os.Stat(sourcePath); err != nil {
 		log.L.Debugf("Source file stat failed %q: %v", sourcePath, err)
 		return fmt.Errorf("failed to stat source file: %w", err)
 	}
 
-	// Register this file as the source for the chunkdigest
+	// Register the file path for this digest
 	hm.digestToFile[chunkdigest] = sourcePath
 	log.L.Debugf("Registered file %q as source for digest %q", sourcePath, chunkdigest)
 
-	// Create or update digest mapping
+	// Create or update the digest-to-keys mapping
+	return hm.mapKeyToDigestLocked(key, chunkdigest)
+}
+
+// mapKeyToDigestLocked maps a key to a digest (must be called with lock held)
+func (hm *HardlinkManager) mapKeyToDigestLocked(key string, chunkdigest string) error {
+	// Get or create the mapping for this digest
 	mapping, exists := hm.digestToKeys[chunkdigest]
 	if !exists {
 		mapping = &ChunkDigestMapping{
@@ -185,6 +198,98 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string, chunkdigest
 		}
 		hm.digestToKeys[chunkdigest] = mapping
 	}
+
+	// Add key to mapping and update reverse index
+	mapping.Keys = append(mapping.Keys, key)
+	hm.keyToDigest[key] = chunkdigest
+	hm.dirty = true
+	return nil
+}
+
+// RegisterDigestFile registers a file as the primary source for a digest
+func (hm *HardlinkManager) RegisterDigestFile(chunkdigest string, filePath string) error {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	// Verify the file exists
+	if _, err := os.Stat(filePath); err != nil {
+		return fmt.Errorf("file does not exist at %q: %w", filePath, err)
+	}
+
+	// Store the mapping
+	hm.digestToFile[chunkdigest] = filePath
+	log.L.Debugf("Registered file %q as primary source for digest %q", filePath, chunkdigest)
+
+	// Mark as dirty for async persistence
+	hm.dirty = true
+	return nil
+}
+
+// GetLinkByDigest returns the file path for a given digest
+func (hm *HardlinkManager) GetLinkByDigest(chunkdigest string) (string, bool) {
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
+
+	filePath, exists := hm.digestToFile[chunkdigest]
+	if !exists {
+		return "", false
+	}
+
+	// Verify the file still exists
+	if _, err := os.Stat(filePath); err != nil {
+		log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, filePath, err)
+
+		// We need to acquire a write lock
+		hm.mu.RUnlock()
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		delete(hm.digestToFile, chunkdigest)
+		hm.dirty = true
+		return "", false
+	}
+
+	return filePath, true
+}
+
+// MapKeyToDigest maps a key to a digest
+func (hm *HardlinkManager) MapKeyToDigest(key string, chunkdigest string) error {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	// Check if the digest is registered
+	if _, exists := hm.digestToFile[chunkdigest]; !exists {
+		return fmt.Errorf("digest %q is not registered", chunkdigest)
+	}
+
+	// Update the mapping
+	if oldDigest, exists := hm.keyToDigest[key]; exists {
+		// Remove key from old digest mapping
+		if mapping, ok := hm.digestToKeys[oldDigest]; ok {
+			for i, k := range mapping.Keys {
+				if k == key {
+					mapping.Keys = append(mapping.Keys[:i], mapping.Keys[i+1:]...)
+					break
+				}
+			}
+			// If no more keys, remove the mapping
+			if len(mapping.Keys) == 0 {
+				delete(hm.digestToKeys, oldDigest)
+			}
+		}
+	}
+
+	// Get or create the mapping for this digest
+	mapping, exists := hm.digestToKeys[chunkdigest]
+	if !exists {
+		mapping = &ChunkDigestMapping{
+			Digest: chunkdigest,
+			Keys:   make([]string, 0),
+		}
+		hm.digestToKeys[chunkdigest] = mapping
+	}
+
+	// Add key to mapping
 	mapping.Keys = append(mapping.Keys, key)
 	hm.keyToDigest[key] = chunkdigest
 
@@ -193,26 +298,25 @@ func (hm *HardlinkManager) CreateLink(key string, sourcePath string, chunkdigest
 	return nil
 }
 
-// cleanup cleans up expired digest files
+// cleanup removes unused digest mappings
 func (hm *HardlinkManager) cleanup() error {
 	// Use a timeout context
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	// Try to acquire lock with timeout
 	lockChan := make(chan struct{})
 	go func() {
 		hm.mu.Lock()
 		close(lockChan)
 	}()
+
 	select {
 	case <-lockChan:
 		defer hm.mu.Unlock()
 	case <-ctx.Done():
 		return fmt.Errorf("timeout waiting for lock")
 	}
-
-	// This is a simplified cleanup that only removes unreferenced digests
-	// A more sophisticated version would also track last used time for digests
 
 	// Find all digests that don't have any keys
 	unusedDigests := make([]string, 0)
@@ -392,226 +496,7 @@ func (hm *HardlinkManager) persistWorker() {
 	}
 }
 
-// AddKeyToDigest adds a key to the chunkdigest mapping
-func (hm *HardlinkManager) AddKeyToDigest(key string, chunkdigest string) error {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	// Check if the key already exists using the reverse index
-	if _, exists := hm.keyToDigest[key]; exists {
-		return fmt.Errorf("key %q already exists in digest mapping", key)
-	}
-
-	// Get or create the mapping for this digest
-	mapping, exists := hm.digestToKeys[chunkdigest]
-	if !exists {
-		mapping = &ChunkDigestMapping{
-			Digest: chunkdigest,
-			Keys:   make([]string, 0),
-		}
-		hm.digestToKeys[chunkdigest] = mapping
-	}
-
-	// Add the key to the mapping and update reverse index
-	mapping.Keys = append(mapping.Keys, key)
-	hm.keyToDigest[key] = chunkdigest
-	hm.dirty = true
-	return nil
-}
-
-// GetKeysForDigest returns all keys associated with a chunkdigest
-func (hm *HardlinkManager) GetKeysForDigest(chunkdigest string) ([]string, bool) {
-	hm.mu.RLock()
-	defer hm.mu.RUnlock()
-
-	mapping, exists := hm.digestToKeys[chunkdigest]
-	if !exists {
-		return nil, false
-	}
-	return mapping.Keys, true
-}
-
-// RemoveKeyFromDigest removes a key from its associated chunkdigest mapping
-func (hm *HardlinkManager) RemoveKeyFromDigest(key string) error {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	// Find the chunkdigest using the reverse index
-	chunkdigest, exists := hm.keyToDigest[key]
-	if !exists {
-		return fmt.Errorf("key %q not found in any digest mapping", key)
-	}
-
-	// Get the mapping
-	mapping, exists := hm.digestToKeys[chunkdigest]
-	if !exists {
-		return fmt.Errorf("digest mapping not found for key %q", key)
-	}
-
-	// Remove the key from the slice
-	for i, k := range mapping.Keys {
-		if k == key {
-			mapping.Keys = append(mapping.Keys[:i], mapping.Keys[i+1:]...)
-			break
-		}
-	}
-
-	// Remove from reverse index
-	delete(hm.keyToDigest, key)
-
-	// If no more keys, remove the entire mapping
-	if len(mapping.Keys) == 0 {
-		delete(hm.digestToKeys, chunkdigest)
-	}
-
-	hm.dirty = true
-	return nil
-}
-
-// CreateOrGetHardlink creates a hardlink for a chunkdigest if it exists, or creates a new mapping if it doesn't
-func (hm *HardlinkManager) CreateOrGetHardlink(key string, chunkdigest string, sourcePath string) error {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	// Check if the key already exists using the reverse index
-	if _, exists := hm.keyToDigest[key]; exists {
-		return fmt.Errorf("key %q already exists in digest mapping", key)
-	}
-
-	// Check if chunkdigest exists
-	if existingFilePath, exists := hm.digestToFile[chunkdigest]; exists {
-		// Verify the file still exists
-		if _, err := os.Stat(existingFilePath); err != nil {
-			log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, existingFilePath, err)
-			delete(hm.digestToFile, chunkdigest)
-			// Register the new source path instead
-			hm.digestToFile[chunkdigest] = sourcePath
-		}
-
-		// Get or create mapping for this digest
-		mapping, exists := hm.digestToKeys[chunkdigest]
-		if !exists {
-			mapping = &ChunkDigestMapping{
-				Digest: chunkdigest,
-				Keys:   make([]string, 0),
-			}
-			hm.digestToKeys[chunkdigest] = mapping
-		}
-
-		// Add key to mapping and update reverse index
-		mapping.Keys = append(mapping.Keys, key)
-		hm.keyToDigest[key] = chunkdigest
-		hm.dirty = true
-		return nil
-	}
-
-	// If chunkdigest doesn't exist, register it with the source path
-	hm.digestToFile[chunkdigest] = sourcePath
-	log.L.Debugf("Registered file %q as source for digest %q", sourcePath, chunkdigest)
-
-	// Create new mapping and update reverse index
-	mapping := &ChunkDigestMapping{
-		Digest: chunkdigest,
-		Keys:   []string{key},
-	}
-	hm.digestToKeys[chunkdigest] = mapping
-	hm.keyToDigest[key] = chunkdigest
-	hm.dirty = true
-	return nil
-}
-
-// RegisterDigestFile registers a file as the primary source for a digest
-func (hm *HardlinkManager) RegisterDigestFile(chunkdigest string, filePath string) error {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	// Verify the file exists
-	if _, err := os.Stat(filePath); err != nil {
-		return fmt.Errorf("file does not exist at %q: %w", filePath, err)
-	}
-
-	// Store the mapping
-	hm.digestToFile[chunkdigest] = filePath
-	log.L.Debugf("Registered file %q as primary source for digest %q", filePath, chunkdigest)
-
-	// Mark as dirty for async persistence
-	hm.dirty = true
-	return nil
-}
-
-// GetLinkByDigest returns the file path for a given digest
-func (hm *HardlinkManager) GetLinkByDigest(chunkdigest string) (string, bool) {
-	hm.mu.RLock()
-	defer hm.mu.RUnlock()
-
-	filePath, exists := hm.digestToFile[chunkdigest]
-	if !exists {
-		return "", false
-	}
-
-	// Verify the file still exists
-	if _, err := os.Stat(filePath); err != nil {
-		log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, filePath, err)
-
-		// We'll need a write lock to remove it
-		hm.mu.RUnlock()
-		hm.mu.Lock()
-		defer hm.mu.Unlock()
-
-		delete(hm.digestToFile, chunkdigest)
-		hm.dirty = true
-		return "", false
-	}
-
-	return filePath, true
-}
-
-// MapKeyToDigest maps a key to a digest
-func (hm *HardlinkManager) MapKeyToDigest(key string, chunkdigest string) error {
-	hm.mu.Lock()
-	defer hm.mu.Unlock()
-
-	// Check if the digest is registered
-	if _, exists := hm.digestToFile[chunkdigest]; !exists {
-		return fmt.Errorf("digest %q is not registered", chunkdigest)
-	}
-
-	// Update the mapping
-	if oldDigest, exists := hm.keyToDigest[key]; exists {
-		// Remove key from old digest mapping
-		if mapping, ok := hm.digestToKeys[oldDigest]; ok {
-			for i, k := range mapping.Keys {
-				if k == key {
-					mapping.Keys = append(mapping.Keys[:i], mapping.Keys[i+1:]...)
-					break
-				}
-			}
-			// If no more keys, remove the mapping
-			if len(mapping.Keys) == 0 {
-				delete(hm.digestToKeys, oldDigest)
-			}
-		}
-	}
-
-	// Get or create the mapping for this digest
-	mapping, exists := hm.digestToKeys[chunkdigest]
-	if !exists {
-		mapping = &ChunkDigestMapping{
-			Digest: chunkdigest,
-			Keys:   make([]string, 0),
-		}
-		hm.digestToKeys[chunkdigest] = mapping
-	}
-
-	// Add key to mapping
-	mapping.Keys = append(mapping.Keys, key)
-	hm.keyToDigest[key] = chunkdigest
-
-	// Mark as dirty for async persistence
-	hm.dirty = true
-	return nil
-}
-
+// Close stops background goroutines and persists data
 func (hm *HardlinkManager) Close() error {
 	// Stop all background goroutines
 	hm.persistTicker.Stop()
