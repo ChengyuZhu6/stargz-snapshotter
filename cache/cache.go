@@ -239,6 +239,27 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 
 	// Try to get from memory cache
 	if !dc.direct && !opt.direct {
+		if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+			if b, done, ok := dc.cache.Get(opt.chunkDigest); ok {
+				return &reader{
+					ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
+					closeFunc: func() error {
+						done()
+						return nil
+					},
+				}, nil
+			}
+			// Get data from disk. If the file is already opened, use it.
+			if f, done, ok := dc.fileCache.Get(opt.chunkDigest); ok {
+				return &reader{
+					ReaderAt: f.(*os.File),
+					closeFunc: func() error {
+						done() // file will be closed when it's evicted from the cache
+						return nil
+					},
+				}, nil
+			}
+		}
 		if b, done, ok := dc.cache.Get(key); ok {
 			return &reader{
 				ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
@@ -296,10 +317,18 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	return &reader{
 		ReaderAt: file,
 		closeFunc: func() error {
-			_, done, added := dc.fileCache.Add(key, file)
-			defer done()
-			if !added {
-				return file.Close()
+			if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+				_, done, added := dc.fileCache.Add(opt.chunkDigest, file)
+				defer done()
+				if !added {
+					return file.Close()
+				}
+			} else {
+				_, done, added := dc.fileCache.Add(key, file)
+				defer done()
+				if !added {
+					return file.Close()
+				}
 			}
 			return nil
 		},
