@@ -18,6 +18,7 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -39,19 +40,20 @@ var (
 	hlManagerMu     sync.RWMutex
 )
 
-type linkInfo struct {
-	SourcePath string    `json:"source"`
-	LinkPath   string    `json:"link"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastUsed   time.Time `json:"last_used"`
+// ChunkDigestMapping represents a mapping from chunkdigest to multiple keys
+type ChunkDigestMapping struct {
+	Digest string   `json:"digest"`
+	Keys   []string `json:"keys"`
 }
 
-// HardlinkManager manages creation, recovery and cleanup of hardlinks
+// HardlinkManager manages digest-to-file mappings and key-to-digest mappings
 type HardlinkManager struct {
 	root            string
 	hlDir           string
 	mu              sync.RWMutex
-	links           map[string]*linkInfo
+	digestToKeys    map[string]*ChunkDigestMapping // Maps chunkdigest to its associated keys
+	keyToDigest     map[string]string              // Reverse index: maps key to its chunkdigest
+	digestToFile    map[string]string              // Maps chunkdigest directly to file path
 	cleanupInterval time.Duration
 	// For batched persistence
 	dirty         bool
@@ -73,7 +75,9 @@ func NewHardlinkManager(root string) (*HardlinkManager, error) {
 	hm := &HardlinkManager{
 		root:            root,
 		hlDir:           hlDir,
-		links:           make(map[string]*linkInfo),
+		digestToKeys:    make(map[string]*ChunkDigestMapping),
+		keyToDigest:     make(map[string]string),
+		digestToFile:    make(map[string]string),
 		cleanupInterval: 24 * time.Hour,
 		persistTicker:   time.NewTicker(5 * time.Second), // Batch writes every 5 seconds
 		persistDone:     make(chan struct{}),
@@ -87,7 +91,7 @@ func NewHardlinkManager(root string) (*HardlinkManager, error) {
 	}
 
 	// Start periodic cleanup and persistence
-	go hm.periodicCleanup()
+	// go hm.periodicCleanup()
 	go hm.persistWorker()
 
 	return hm, nil
@@ -117,104 +121,197 @@ func GetGlobalHardlinkManager(root string) (*HardlinkManager, error) {
 	return globalHLManager, nil
 }
 
-// CreateLink creates a hardlink with retry logic
-func (hm *HardlinkManager) CreateLink(key string, sourcePath string) error {
+// GetLink gets the file path for a key if it exists
+func (hm *HardlinkManager) GetLink(key string) (string, bool) {
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
+
+	// Get the chunkdigest for this key
+	chunkdigest, exists := hm.keyToDigest[key]
+	if !exists {
+		return "", false
+	}
+
+	// Get the file path for this digest
+	filePath, exists := hm.digestToFile[chunkdigest]
+	if !exists {
+		log.L.Debugf("Digest file not found for key %q with digest %q", key, chunkdigest)
+
+		// We need to acquire a write lock
+		hm.mu.RUnlock()
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		delete(hm.keyToDigest, key)
+		hm.dirty = true
+		return "", false
+	}
+
+	// Verify the file still exists
+	if _, err := os.Stat(filePath); err != nil {
+		log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, filePath, err)
+
+		// We need to acquire a write lock
+		hm.mu.RUnlock()
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		delete(hm.digestToFile, chunkdigest)
+		hm.dirty = true
+		return "", false
+	}
+
+	return filePath, true
+}
+
+// CreateLink registers a file as the source for a chunkdigest and maps a key to it
+func (hm *HardlinkManager) CreateLink(key string, sourcePath string, chunkdigest string) error {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	// Add debug info about source file
-	sourceInfo, err := os.Stat(sourcePath)
-	if err != nil {
+	// Check if the key already exists
+	if _, exists := hm.keyToDigest[key]; exists {
+		return fmt.Errorf("key %q already exists in digest mapping", key)
+	}
+
+	// Verify the source file exists
+	if _, err := os.Stat(sourcePath); err != nil {
 		log.L.Debugf("Source file stat failed %q: %v", sourcePath, err)
 		return fmt.Errorf("failed to stat source file: %w", err)
 	}
 
-	// Create hardlink in hardlinks directory
-	linkPath := BuildCachePath(hm.hlDir, key)
-	if err := os.MkdirAll(filepath.Dir(linkPath), 0700); err != nil {
-		return fmt.Errorf("failed to create link dir: %w", err)
-	}
+	// Register the file path for this digest
+	hm.digestToFile[chunkdigest] = sourcePath
+	log.L.Debugf("Registered file %q as source for digest %q", sourcePath, chunkdigest)
 
-	// Create temporary link path
-	tmpLinkPath := BuildCachePath(hm.hlDir, key+".wip")
-	// Remove temporary link if it exists
-	os.Remove(tmpLinkPath)
+	// Create or update the digest-to-keys mapping
+	return hm.mapKeyToDigestLocked(key, chunkdigest)
+}
 
-	// Retry logic for creating hardlink
-	const maxRetries = 3
-	var lastErr error
-	for i := 0; i < maxRetries; i++ {
-		if err := os.Link(sourcePath, tmpLinkPath); err != nil {
-			lastErr = err
-			if i < maxRetries-1 {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			return fmt.Errorf("failed to create temporary hardlink after %d attempts: %w", maxRetries, lastErr)
+// mapKeyToDigestLocked maps a key to a digest (must be called with lock held)
+func (hm *HardlinkManager) mapKeyToDigestLocked(key string, chunkdigest string) error {
+	// Get or create the mapping for this digest
+	mapping, exists := hm.digestToKeys[chunkdigest]
+	if !exists {
+		mapping = &ChunkDigestMapping{
+			Digest: chunkdigest,
+			Keys:   make([]string, 0),
 		}
-		break
+		hm.digestToKeys[chunkdigest] = mapping
 	}
 
-	// Verify the temporary link
-	tmpInfo, err := os.Stat(tmpLinkPath)
-	if err != nil {
-		os.Remove(tmpLinkPath)
-		return fmt.Errorf("failed to stat temporary link: %w", err)
+	// Add key to mapping and update reverse index
+	mapping.Keys = append(mapping.Keys, key)
+	hm.keyToDigest[key] = chunkdigest
+	hm.dirty = true
+	return nil
+}
+
+// RegisterDigestFile registers a file as the primary source for a digest
+func (hm *HardlinkManager) RegisterDigestFile(chunkdigest string, filePath string) error {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	// Verify the file exists
+	if _, err := os.Stat(filePath); err != nil {
+		return fmt.Errorf("file does not exist at %q: %w", filePath, err)
 	}
 
-	if !os.SameFile(sourceInfo, tmpInfo) {
-		os.Remove(tmpLinkPath)
-		return fmt.Errorf("temporary link verification failed - different inodes")
-	}
+	// Store the mapping
+	hm.digestToFile[chunkdigest] = filePath
+	log.L.Debugf("Registered file %q as primary source for digest %q", filePath, chunkdigest)
 
-	// Atomically rename temporary link to final location
-	if err := os.Rename(tmpLinkPath, linkPath); err != nil {
-		os.Remove(tmpLinkPath)
-		return fmt.Errorf("failed to rename temporary link: %w", err)
-	}
-
-	// Record link info
-	hm.links[key] = &linkInfo{
-		SourcePath: sourcePath,
-		LinkPath:   linkPath,
-		CreatedAt:  time.Now(),
-		LastUsed:   time.Now(),
-	}
 	// Mark as dirty for async persistence
 	hm.dirty = true
 	return nil
 }
 
-// GetLink gets the hardlink path if it exists
-func (hm *HardlinkManager) GetLink(key string) (string, bool) {
+// GetLinkByDigest returns the file path for a given digest
+func (hm *HardlinkManager) GetLinkByDigest(chunkdigest string) (string, bool) {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
-
-	if info, exists := hm.links[key]; exists {
-		// Check if link is still valid
-		if _, err := os.Stat(info.LinkPath); err != nil {
-			log.L.Debugf("Hardlink %q is no longer valid: %v", info.LinkPath, err)
-			delete(hm.links, key)
-			return "", false
-		}
-		// Update last used time
-		info.LastUsed = time.Now()
-		return info.LinkPath, true
+	log.L.Debugf("Getting link for digest %q", chunkdigest)
+	filePath, exists := hm.digestToFile[chunkdigest]
+	if !exists {
+		return "", false
 	}
-	return "", false
+
+	// Verify the file still exists
+	if _, err := os.Stat(filePath); err != nil {
+		log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, filePath, err)
+
+		// We need to acquire a write lock
+		hm.mu.RUnlock()
+		hm.mu.Lock()
+		defer hm.mu.Unlock()
+
+		delete(hm.digestToFile, chunkdigest)
+		hm.dirty = true
+		return "", false
+	}
+	log.L.Debugf("Found link for digest %q: %q", chunkdigest, filePath)
+	return filePath, true
 }
 
-// cleanup cleans up expired hardlinks
+// MapKeyToDigest maps a key to a digest
+func (hm *HardlinkManager) MapKeyToDigest(key string, chunkdigest string) error {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	// Check if the digest is registered
+	if _, exists := hm.digestToFile[chunkdigest]; !exists {
+		return fmt.Errorf("digest %q is not registered", chunkdigest)
+	}
+
+	// Update the mapping
+	if oldDigest, exists := hm.keyToDigest[key]; exists {
+		// Remove key from old digest mapping
+		if mapping, ok := hm.digestToKeys[oldDigest]; ok {
+			for i, k := range mapping.Keys {
+				if k == key {
+					mapping.Keys = append(mapping.Keys[:i], mapping.Keys[i+1:]...)
+					break
+				}
+			}
+			// If no more keys, remove the mapping
+			if len(mapping.Keys) == 0 {
+				delete(hm.digestToKeys, oldDigest)
+			}
+		}
+	}
+
+	// Get or create the mapping for this digest
+	mapping, exists := hm.digestToKeys[chunkdigest]
+	if !exists {
+		mapping = &ChunkDigestMapping{
+			Digest: chunkdigest,
+			Keys:   make([]string, 0),
+		}
+		hm.digestToKeys[chunkdigest] = mapping
+	}
+
+	// Add key to mapping
+	mapping.Keys = append(mapping.Keys, key)
+	hm.keyToDigest[key] = chunkdigest
+
+	// Mark as dirty for async persistence
+	hm.dirty = true
+	return nil
+}
+
+// cleanup removes unused digest mappings
 func (hm *HardlinkManager) cleanup() error {
 	// Use a timeout context
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	// Try to acquire lock with timeout
 	lockChan := make(chan struct{})
 	go func() {
 		hm.mu.Lock()
 		close(lockChan)
 	}()
+
 	select {
 	case <-lockChan:
 		defer hm.mu.Unlock()
@@ -222,36 +319,34 @@ func (hm *HardlinkManager) cleanup() error {
 		return fmt.Errorf("timeout waiting for lock")
 	}
 
-	now := time.Now()
-	expiredKeys := make([]string, 0)
-
-	// Find expired links
-	for key, info := range hm.links {
-		if now.Sub(info.LastUsed) > 30*24*time.Hour {
-			expiredKeys = append(expiredKeys, key)
+	// Find all digests that don't have any keys
+	unusedDigests := make([]string, 0)
+	for digest := range hm.digestToFile {
+		mapping, exists := hm.digestToKeys[digest]
+		if !exists || len(mapping.Keys) == 0 {
+			unusedDigests = append(unusedDigests, digest)
 		}
 	}
 
-	// Remove expired links in batch
-	for _, key := range expiredKeys {
-		info := hm.links[key]
-		if err := os.Remove(info.LinkPath); err != nil && !os.IsNotExist(err) {
-			log.L.Warnf("Failed to remove expired hardlink %q: %v", info.LinkPath, err)
-			continue
-		}
-		delete(hm.links, key)
+	// Remove unused digests
+	for _, digest := range unusedDigests {
+		delete(hm.digestToFile, digest)
+		delete(hm.digestToKeys, digest)
+		log.L.Debugf("Removed unused digest: %q", digest)
 	}
 
-	if len(expiredKeys) > 0 {
-		return hm.persistLocked() // Use persistLocked since we already have the lock
+	if len(unusedDigests) > 0 {
+		hm.dirty = true
+		return hm.persistLocked()
 	}
+
 	return nil
 }
 
-// persistLocked persists link information while holding the lock
+// persistLocked persists digest information while holding the lock
 func (hm *HardlinkManager) persistLocked() error {
-	if len(hm.links) == 0 {
-		log.L.Debugf("No links to persist")
+	if len(hm.digestToKeys) == 0 && len(hm.digestToFile) == 0 {
+		log.L.Debugf("No digest mappings to persist")
 		return nil
 	}
 
@@ -265,10 +360,22 @@ func (hm *HardlinkManager) persistLocked() error {
 
 	defer f.Close()
 
-	// Use more compact JSON encoding
-	if err := json.NewEncoder(f).Encode(hm.links); err != nil {
+	// Create a combined structure for persistence
+	type persistData struct {
+		DigestToKeys map[string]*ChunkDigestMapping `json:"digest_to_keys"`
+		KeyToDigest  map[string]string              `json:"key_to_digest"`
+		DigestToFile map[string]string              `json:"digest_to_file"`
+	}
+
+	data := persistData{
+		DigestToKeys: hm.digestToKeys,
+		KeyToDigest:  hm.keyToDigest,
+		DigestToFile: hm.digestToFile,
+	}
+
+	if err := json.NewEncoder(f).Encode(data); err != nil {
 		os.Remove(tmpFile)
-		return fmt.Errorf("failed to encode links data: %w", err)
+		return fmt.Errorf("failed to encode digest data: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
@@ -282,18 +389,19 @@ func (hm *HardlinkManager) persistLocked() error {
 		return fmt.Errorf("failed to rename links file: %w", err)
 	}
 
-	log.L.Debugf("Persisted %d links", len(hm.links))
+	log.L.Debugf("Persisted %d digest mappings and %d digest files",
+		len(hm.digestToKeys), len(hm.digestToFile))
 	return nil
 }
 
-// persist acquires lock and persists link information
+// persist acquires lock and persists digest information
 func (hm *HardlinkManager) persist() error {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 	return hm.persistLocked()
 }
 
-// restore restores link information from root directory
+// restore restores digest information from root directory
 func (hm *HardlinkManager) restore() error {
 	linksFile := filepath.Join(hm.root, linksFileName)
 
@@ -307,30 +415,50 @@ func (hm *HardlinkManager) restore() error {
 	}
 	defer f.Close()
 
-	// Create a temporary map to avoid corrupting the existing one on error
-	tempLinks := make(map[string]*linkInfo)
-	if err := json.NewDecoder(f).Decode(&tempLinks); err != nil {
+	// Create a temporary structure for restoration
+	type persistData struct {
+		DigestToKeys map[string]*ChunkDigestMapping `json:"digest_to_keys"`
+		KeyToDigest  map[string]string              `json:"key_to_digest"`
+		DigestToFile map[string]string              `json:"digest_to_file"`
+	}
+
+	var data persistData
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
 		return fmt.Errorf("failed to decode links file: %w", err)
 	}
 
-	// Validate restored links
-	validLinks := make(map[string]*linkInfo)
-	for key, info := range tempLinks {
-		// Check if both source and link files exist
-		if _, err := os.Stat(info.SourcePath); err != nil {
-			log.L.Debugf("Skipping invalid link %q: source file missing: %v", key, err)
+	// Validate digest file mappings
+	validDigestFiles := make(map[string]string)
+	for digest, filePath := range data.DigestToFile {
+		if _, err := os.Stat(filePath); err != nil {
+			log.L.Debugf("Skipping invalid digest file mapping %q: file missing: %v", digest, err)
 			continue
 		}
-		if _, err := os.Stat(info.LinkPath); err != nil {
-			log.L.Debugf("Skipping invalid link %q: link file missing: %v", key, err)
-			continue
-		}
-		validLinks[key] = info
+		validDigestFiles[digest] = filePath
 	}
 
-	// Update links map only after validation
-	hm.links = validLinks
-	log.L.Debugf("Successfully restored %d valid links from %s", len(validLinks), linksFile)
+	// Clean up key mappings for invalid digests
+	validDigestToKeys := make(map[string]*ChunkDigestMapping)
+	validKeyToDigest := make(map[string]string)
+
+	for digest, mapping := range data.DigestToKeys {
+		if _, exists := validDigestFiles[digest]; exists {
+			validDigestToKeys[digest] = mapping
+
+			// Validate keys for this digest
+			for _, key := range mapping.Keys {
+				validKeyToDigest[key] = digest
+			}
+		}
+	}
+
+	// Update mappings
+	hm.digestToKeys = validDigestToKeys
+	hm.keyToDigest = validKeyToDigest
+	hm.digestToFile = validDigestFiles
+
+	log.L.Debugf("Successfully restored %d digest mappings and %d digest files from %s",
+		len(validDigestToKeys), len(validDigestFiles), linksFile)
 
 	return nil
 }
@@ -349,7 +477,7 @@ func (hm *HardlinkManager) periodicCleanup() {
 	}
 }
 
-// persistWorker handles periodic persistence of link information
+// persistWorker handles periodic persistence of digest information
 func (hm *HardlinkManager) persistWorker() {
 	for {
 		select {
@@ -369,6 +497,7 @@ func (hm *HardlinkManager) persistWorker() {
 	}
 }
 
+// Close stops background goroutines and persists data
 func (hm *HardlinkManager) Close() error {
 	// Stop all background goroutines
 	hm.persistTicker.Stop()
@@ -377,4 +506,76 @@ func (hm *HardlinkManager) Close() error {
 	close(hm.cleanupDone)
 	// Final persist of any remaining changes
 	return hm.persist()
+}
+
+// HardlinkCapability represents a cache that supports hardlinking
+type HardlinkCapability interface {
+	// RegisterDigestFile registers a file as the primary source for a digest
+	RegisterDigestFile(chunkDigest string, filepath string) error
+	// GetLinkByDigest returns the file path for a given digest
+	GetLinkByDigest(chunkDigest string) (string, bool)
+	// MapKeyToDigest maps a key to a digest
+	MapKeyToDigest(key string, chunkDigest string) error
+	// CreateLink registers a file as the source for a chunkdigest and maps a key to it
+	CreateLink(key string, sourcePath string, chunkdigest string) error
+	// GetLink gets the file path for a key if it exists
+	GetLink(key string) (string, bool)
+}
+
+// TryCreateHardlink attempts to create a hardlink from an existing digest file to a key path
+// Returns true if successful, false otherwise
+func (hm *HardlinkManager) TryCreateHardlink(key string, chunkdigest string, targetPath string) bool {
+	// Try to get existing file for this digest
+	if digestPath, exists := hm.GetLinkByDigest(chunkdigest); exists {
+		// Skip if source and target paths are the same
+		if digestPath != targetPath {
+			// Ensure target directory exists
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+				log.L.Debugf("Failed to create directory for hardlink: %v", err)
+				return false
+			}
+
+			// Remove existing file if any
+			_ = os.Remove(targetPath)
+
+			// Create hardlink
+			if err := os.Link(digestPath, targetPath); err != nil {
+				log.L.Debugf("Failed to create hardlink from digest %q to key %q: %v",
+					chunkdigest, key, err)
+				return false
+			}
+			log.L.Debugf("Created hardlink from digest %q to key %q", chunkdigest, key)
+			return true
+		}
+	}
+	return false
+}
+
+// GenerateInternalKey creates a consistent internal key for a directory and key combination
+func (hm *HardlinkManager) GenerateInternalKey(directory, key string) string {
+	internalKey := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", directory, key)))
+	return fmt.Sprintf("%x", internalKey)
+}
+
+// IsEnabled returns true if the hardlink manager is properly initialized
+func (hm *HardlinkManager) IsEnabled() bool {
+	return hm != nil
+}
+
+// InitializeHardlinkManager creates a hardlink manager for the given cache directory
+// Returns the manager and a boolean indicating if hardlinking is enabled
+func InitializeHardlinkManager(cacheDir string, enableHardlink bool) (*HardlinkManager, bool) {
+	if !enableHardlink {
+		log.L.Infof("Hardlink feature is disabled for cache directory: %q", cacheDir)
+		return nil, false
+	}
+
+	// Get root directory for hardlink manager (../../)
+	hlManager, err := GetGlobalHardlinkManager(cacheDir)
+	if err != nil {
+		log.L.Warnf("Failed to initialize hardlink manager: %v", err)
+		return nil, false
+	}
+	log.L.Infof("Using global hardlink manager with root directory: %q", cacheDir)
+	return hlManager, true
 }

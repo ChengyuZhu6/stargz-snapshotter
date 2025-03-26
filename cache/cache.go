@@ -102,6 +102,7 @@ type Writer interface {
 type cacheOpt struct {
 	direct      bool
 	passThrough bool
+	chunkDigest string
 }
 
 type Option func(o *cacheOpt) *cacheOpt
@@ -122,6 +123,14 @@ func Direct() Option {
 func PassThrough() Option {
 	return func(o *cacheOpt) *cacheOpt {
 		o.passThrough = true
+		return o
+	}
+}
+
+// ChunkDigest option allows specifying a chunk digest for the cache
+func ChunkDigest(digest string) Option {
+	return func(o *cacheOpt) *cacheOpt {
+		o.chunkDigest = digest
 		return o
 	}
 }
@@ -180,19 +189,11 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	}
 	dc.syncAdd = config.SyncAdd
 
-	// Log hardlink configuration
+	// Initialize hardlink manager if enabled
 	if config.EnableHardlink {
-		log.L.Infof("Hardlink feature is enabled for cache directory: %q", directory)
-		// Get root directory for hardlink manager (../../)
-		rootDir := filepath.Dir(filepath.Dir(directory))
-		hlManager, err := GetGlobalHardlinkManager(rootDir)
-		if err != nil {
-			return nil, err
-		}
-		log.L.Infof("Using global hardlink manager with root directory: %q", rootDir)
+		hlManager, enabled := InitializeHardlinkManager(filepath.Dir(filepath.Dir(directory)), config.EnableHardlink)
 		dc.hlManager = hlManager
-	} else {
-		log.L.Infof("Hardlink feature is disabled for cache directory: %q", directory)
+		dc.enableHardlink = enabled
 	}
 
 	return dc, nil
@@ -230,47 +231,70 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 
 	// Try to get from memory cache
 	if !dc.direct && !opt.direct {
-		if b, done, ok := dc.cache.Get(key); ok {
-			return &reader{
-				ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
-				closeFunc: func() error {
-					done()
-					return nil
-				},
-			}, nil
+		if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+			if b, done, ok := dc.cache.Get(opt.chunkDigest); ok {
+				return &reader{
+					ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
+					closeFunc: func() error {
+						done()
+						return nil
+					},
+				}, nil
+			}
+			// Get data from disk. If the file is already opened, use it.
+			if f, done, ok := dc.fileCache.Get(opt.chunkDigest); ok {
+				return &reader{
+					ReaderAt: f.(*os.File),
+					closeFunc: func() error {
+						done() // file will be closed when it's evicted from the cache
+						return nil
+					},
+				}, nil
+			}
+		} else {
+			if b, done, ok := dc.cache.Get(key); ok {
+				return &reader{
+					ReaderAt: bytes.NewReader(b.(*bytes.Buffer).Bytes()),
+					closeFunc: func() error {
+						done()
+						return nil
+					},
+				}, nil
+			}
+
+			// Get data from disk. If the file is already opened, use it.
+			if f, done, ok := dc.fileCache.Get(key); ok {
+				return &reader{
+					ReaderAt: f.(*os.File),
+					closeFunc: func() error {
+						done() // file will be closed when it's evicted from the cache
+						return nil
+					},
+				}, nil
+			}
 		}
 
-		// Get data from disk. If the file is already opened, use it.
-		if f, done, ok := dc.fileCache.Get(key); ok {
-			return &reader{
-				ReaderAt: f.(*os.File),
-				closeFunc: func() error {
-					done() // file will be closed when it's evicted from the cache
-					return nil
-				},
-			}, nil
-		}
 	}
 
-	// Try to get from hardlink first
+	// First try regular file path
 	filepath := BuildCachePath(dc.directory, key)
-	if dc.hlManager != nil {
-		if linkPath, exists := dc.hlManager.GetLink(key); exists {
-			filepath = linkPath
+
+	// If chunkDigest is provided, try to find it in the hardlink manager
+	if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+		if digestPath, exists := dc.hlManager.GetLinkByDigest(opt.chunkDigest); exists {
+			// Use the found path for this digest
+			log.L.Debugf("Using existing file for digest %q instead of key %q", opt.chunkDigest, key)
+			filepath = digestPath
 		}
 	}
 
 	// Open the cache file and read the target region
-	// TODO: If the target cache is write-in-progress, should we wait for the completion
-	//       or simply report the cache miss?
 	file, err := os.Open(filepath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open blob file for %q: %w", key, err)
 	}
 
 	// If in direct mode, don't cache file descriptor
-	// This option is useful for preventing memory cache from being polluted by data
-	// that won't be accessed immediately.
 	if dc.direct || opt.direct {
 		return &reader{
 			ReaderAt: file,
@@ -284,16 +308,21 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	}
 
 	// Cache file descriptor
-	// TODO: should we cache the entire file data on memory?
-	//       but making I/O (possibly huge) on every fetching
-	//       might be costly.
 	return &reader{
 		ReaderAt: file,
 		closeFunc: func() error {
-			_, done, added := dc.fileCache.Add(key, file)
-			defer done()
-			if !added {
-				return file.Close()
+			if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+				_, done, added := dc.fileCache.Add(opt.chunkDigest, file)
+				defer done()
+				if !added {
+					return file.Close()
+				}
+			} else {
+				_, done, added := dc.fileCache.Add(key, file)
+				defer done()
+				if !added {
+					return file.Close()
+				}
 			}
 			return nil
 		},
@@ -310,17 +339,24 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		opt = o(opt)
 	}
 
-	// Check hardlink first before creating new cache file
-	if dc.hlManager != nil {
-		if linkPath, exists := dc.hlManager.GetLink(key); exists {
-			if _, err := os.Stat(linkPath); err == nil {
-				// Hardlink exists and is valid, use it
-				return &writer{
-					WriteCloser: nopWriteCloser(io.Discard),
-					commitFunc:  func() error { return nil },
-					abortFunc:   func() error { return nil },
-				}, nil
+	// If chunkdigest is provided, check if it already exists
+	if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+		keyPath := BuildCachePath(dc.directory, key)
+
+		// Try to create a hardlink from existing digest file
+		if dc.hlManager.TryCreateHardlink(key, opt.chunkDigest, keyPath) {
+			// Map key to digest
+			internalKey := dc.hlManager.GenerateInternalKey(dc.directory, key)
+			if err := dc.hlManager.MapKeyToDigest(internalKey, opt.chunkDigest); err != nil {
+				log.L.Warnf("Failed to map key to digest: %v", err)
 			}
+
+			// Return a no-op writer since the file already exists
+			return &writer{
+				WriteCloser: nopWriteCloser(io.Discard),
+				commitFunc:  func() error { return nil },
+				abortFunc:   func() error { return nil },
+			}, nil
 		}
 	}
 
@@ -348,11 +384,17 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				return fmt.Errorf("failed to commit cache file: %w", err)
 			}
 
-			// Create hardlink after file is committed
-			if dc.hlManager != nil {
-				if err := dc.CreateHardlink(key); err != nil {
-					// Log error but don't affect main flow
-					log.L.Debugf("Failed to create hardlink: %v", err)
+			// If chunkdigest is provided, store the mapping
+			if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+				// Register this file as the primary source for this digest
+				if err := dc.hlManager.RegisterDigestFile(opt.chunkDigest, targetPath); err != nil {
+					log.L.Debugf("Failed to register digest file: %v", err)
+				}
+
+				// Map key to digest
+				internalKey := dc.hlManager.GenerateInternalKey(dc.directory, key)
+				if err := dc.hlManager.MapKeyToDigest(internalKey, opt.chunkDigest); err != nil {
+					log.L.Debugf("Failed to map key to digest: %v", err)
 				}
 			}
 
@@ -471,34 +513,36 @@ func nopWriteCloser(w io.Writer) io.WriteCloser {
 	return &writeCloser{w, func() error { return nil }}
 }
 
-// HardlinkCapability represents a cache that supports hardlinking
-type HardlinkCapability interface {
-	// CreateHardlink creates a hardlink for the cached file
-	CreateHardlink(key string) error
-	// HasHardlink checks if a hardlink exists for the given key
-	HasHardlink(key string) bool
-}
-
-func (dc *directoryCache) CreateHardlink(key string) error {
+// RegisterDigestFile registers a file as the primary source for a digest
+func (dc *directoryCache) RegisterDigestFile(chunkDigest string, filepath string) error {
 	if !dc.enableHardlink || dc.hlManager == nil {
-		log.L.Debugf("Hardlink creation skipped for key %q: feature not enabled", key)
+		log.L.Debugf("Digest file registration skipped: feature not enabled")
 		return nil
 	}
-	log.L.Debugf("Creating hardlink for key %q", key)
-	return dc.hlManager.CreateLink(key, BuildCachePath(dc.directory, key))
+
+	if chunkDigest == "" {
+		return fmt.Errorf("chunk digest cannot be empty")
+	}
+
+	return dc.hlManager.RegisterDigestFile(chunkDigest, filepath)
 }
 
-func (dc *directoryCache) HasHardlink(key string) bool {
+// GetLinkByDigest returns the file path for a given digest
+func (dc *directoryCache) GetLinkByDigest(chunkDigest string) (string, bool) {
 	if !dc.enableHardlink || dc.hlManager == nil {
-		log.L.Debugf("Hardlink check skipped for key %q: feature not enabled", key)
-		return false
+		return "", false
 	}
-	if _, exists := dc.hlManager.GetLink(key); exists {
-		log.L.Debugf("Found existing hardlink for key %q", key)
-		return true
+
+	return dc.hlManager.GetLinkByDigest(chunkDigest)
+}
+
+// MapKeyToDigest maps a key to a digest
+func (dc *directoryCache) MapKeyToDigest(key string, chunkDigest string) error {
+	if !dc.enableHardlink || dc.hlManager == nil {
+		return nil
 	}
-	log.L.Debugf("No hardlink found for key %q", key)
-	return false
+
+	return dc.hlManager.MapKeyToDigest(key, chunkDigest)
 }
 
 // wrapMemoryWriter wraps a writer with memory caching

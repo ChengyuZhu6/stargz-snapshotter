@@ -505,6 +505,7 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 		return fmt.Errorf("layer is already closed")
 	}
 	rootID := l.verifiableReader.Metadata().RootID()
+	digest := ""
 	if _, _, err := l.verifiableReader.Metadata().GetChild(rootID, estargz.NoPrefetchLandmark); err == nil {
 		// do not prefetch this layer
 		return nil
@@ -515,14 +516,22 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 		}
 		// override the prefetch size with optimized value
 		prefetchSize = offset
+		digest, err = l.verifiableReader.Metadata().GetDigest(id, true)
+		if err != nil {
+			return fmt.Errorf("failed to get digest of prefetch landmark: %w", err)
+		}
 	} else if prefetchSize > l.blob.Size() {
 		// adjust prefetch size not to exceed the whole layer size
 		prefetchSize = l.blob.Size()
+		digest, err = l.verifiableReader.Metadata().GetDigest(rootID, false)
+		if err != nil {
+			return fmt.Errorf("failed to get digest of prefetch landmark: %w", err)
+		}
 	}
 
 	// Fetch the target range
 	downloadStart := time.Now()
-	err := l.blob.Cache(0, prefetchSize)
+	err := l.blob.Cache(0, prefetchSize, remote.WithCacheOpts(cache.ChunkDigest(digest)))
 	commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.PrefetchDownload, downloadStart) // time to download prefetch data
 
 	if err != nil {
