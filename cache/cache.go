@@ -102,6 +102,7 @@ type Writer interface {
 type cacheOpt struct {
 	direct      bool
 	passThrough bool
+	chunkDigest string
 }
 
 type Option func(o *cacheOpt) *cacheOpt
@@ -122,6 +123,14 @@ func Direct() Option {
 func PassThrough() Option {
 	return func(o *cacheOpt) *cacheOpt {
 		o.passThrough = true
+		return o
+	}
+}
+
+// ChunkDigest option allows specifying a chunk digest for the cache
+func ChunkDigest(digest string) Option {
+	return func(o *cacheOpt) *cacheOpt {
+		o.chunkDigest = digest
 		return o
 	}
 }

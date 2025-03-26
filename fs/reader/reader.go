@@ -248,6 +248,7 @@ func (vr *VerifiableReader) readAndCache(id uint32, fr io.Reader, chunkOffset, c
 	if _, err := br.Peek(int(chunkSize)); err != nil {
 		return fmt.Errorf("cacheWithReader.peek: %v", err)
 	}
+	opts = append(opts, cache.ChunkDigest(chunkDigest))
 	w, err := gr.cache.Add(cacheID, opts...)
 	if err != nil {
 		return err
