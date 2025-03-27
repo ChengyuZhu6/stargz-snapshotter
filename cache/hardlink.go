@@ -90,7 +90,7 @@ func NewHardlinkManager(root string) (*HardlinkManager, error) {
 	}
 
 	// Start periodic cleanup and persistence
-	go hm.periodicCleanup()
+	// go hm.periodicCleanup()
 	go hm.persistWorker()
 
 	return hm, nil
@@ -248,7 +248,7 @@ func (hm *HardlinkManager) GetLinkByDigest(chunkdigest string) (string, bool) {
 		hm.dirty = true
 		return "", false
 	}
-
+	log.L.Debugf("Found link for digest %q: %q", chunkdigest, filePath)
 	return filePath, true
 }
 

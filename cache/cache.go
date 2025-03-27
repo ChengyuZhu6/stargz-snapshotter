@@ -354,32 +354,35 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 			// Create a hardlink from the existing digest file to the key path
 			keyPath := BuildCachePath(dc.directory, key)
 
-			// Ensure target directory exists
-			if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
-				return nil, fmt.Errorf("failed to create cache directory: %w", err)
-			}
-
-			// Remove existing file if any
-			_ = os.Remove(keyPath)
-
-			// Create hardlink
-			if err := os.Link(digestPath, keyPath); err != nil {
-				log.L.Warnf("Failed to create hardlink from digest %q to key %q: %v",
-					opt.chunkDigest, key, err)
-			} else {
-				log.L.Debugf("Created hardlink from digest %q to key %q", opt.chunkDigest, key)
-
-				// Map key to digest
-				if err := dc.hlManager.MapKeyToDigest(key, opt.chunkDigest); err != nil {
-					log.L.Warnf("Failed to map key to digest: %v", err)
+			// Skip if source and target paths are the same
+			if digestPath != keyPath {
+				// Ensure target directory exists
+				if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
+					return nil, fmt.Errorf("failed to create cache directory: %w", err)
 				}
 
-				// Return a no-op writer since the file already exists
-				return &writer{
-					WriteCloser: nopWriteCloser(io.Discard),
-					commitFunc:  func() error { return nil },
-					abortFunc:   func() error { return nil },
-				}, nil
+				// Remove existing file if any
+				_ = os.Remove(keyPath)
+
+				// Create hardlink
+				if err := os.Link(digestPath, keyPath); err != nil {
+					log.L.Warnf("Failed to create hardlink from digest %q to key %q: %v",
+						opt.chunkDigest, key, err)
+				} else {
+					log.L.Debugf("Created hardlink from digest %q to key %q", opt.chunkDigest, key)
+
+					// Map key to digest
+					if err := dc.hlManager.MapKeyToDigest(key, opt.chunkDigest); err != nil {
+						log.L.Warnf("Failed to map key to digest: %v", err)
+					}
+
+					// Return a no-op writer since the file already exists
+					return &writer{
+						WriteCloser: nopWriteCloser(io.Discard),
+						commitFunc:  func() error { return nil },
+						abortFunc:   func() error { return nil },
+					}, nil
+				}
 			}
 		}
 	}
