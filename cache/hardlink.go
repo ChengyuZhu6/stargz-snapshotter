@@ -229,7 +229,7 @@ func (hm *HardlinkManager) RegisterDigestFile(chunkdigest string, filePath strin
 func (hm *HardlinkManager) GetLinkByDigest(chunkdigest string) (string, bool) {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
-
+	log.L.Debugf("Getting link for digest %q", chunkdigest)
 	filePath, exists := hm.digestToFile[chunkdigest]
 	if !exists {
 		return "", false
