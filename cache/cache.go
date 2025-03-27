@@ -18,6 +18,7 @@ package cache
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -372,7 +373,8 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 					log.L.Debugf("Created hardlink from digest %q to key %q", opt.chunkDigest, key)
 
 					// Map key to digest
-					if err := dc.hlManager.MapKeyToDigest(key, opt.chunkDigest); err != nil {
+					internalKey := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", dc.directory, key)))
+					if err := dc.hlManager.MapKeyToDigest(string(internalKey[:]), opt.chunkDigest); err != nil {
 						log.L.Warnf("Failed to map key to digest: %v", err)
 					}
 
@@ -419,7 +421,8 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				}
 
 				// Map key to digest
-				if err := dc.hlManager.MapKeyToDigest(key, opt.chunkDigest); err != nil {
+				internalKey := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", dc.directory, key)))
+				if err := dc.hlManager.MapKeyToDigest(string(internalKey[:]), opt.chunkDigest); err != nil {
 					log.L.Debugf("Failed to map key to digest: %v", err)
 				}
 			}
