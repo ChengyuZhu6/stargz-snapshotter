@@ -18,7 +18,6 @@ package cache
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -190,19 +189,11 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 	}
 	dc.syncAdd = config.SyncAdd
 
-	// Log hardlink configuration
+	// Initialize hardlink manager if enabled
 	if config.EnableHardlink {
-		log.L.Infof("Hardlink feature is enabled for cache directory: %q", directory)
-		// Get root directory for hardlink manager (../../)
-		rootDir := filepath.Dir(filepath.Dir(directory))
-		hlManager, err := GetGlobalHardlinkManager(rootDir)
-		if err != nil {
-			return nil, err
-		}
-		log.L.Infof("Using global hardlink manager with root directory: %q", rootDir)
+		hlManager, enabled := InitializeHardlinkManager(filepath.Dir(filepath.Dir(directory)), config.EnableHardlink)
 		dc.hlManager = hlManager
-	} else {
-		log.L.Infof("Hardlink feature is disabled for cache directory: %q", directory)
+		dc.enableHardlink = enabled
 	}
 
 	return dc, nil
@@ -350,42 +341,22 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 
 	// If chunkdigest is provided, check if it already exists
 	if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
-		// Try to get existing file for this digest
-		if digestPath, exists := dc.hlManager.GetLinkByDigest(opt.chunkDigest); exists {
-			// Create a hardlink from the existing digest file to the key path
-			keyPath := BuildCachePath(dc.directory, key)
+		keyPath := BuildCachePath(dc.directory, key)
 
-			// Skip if source and target paths are the same
-			if digestPath != keyPath {
-				// Ensure target directory exists
-				if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
-					return nil, fmt.Errorf("failed to create cache directory: %w", err)
-				}
-
-				// Remove existing file if any
-				_ = os.Remove(keyPath)
-
-				// Create hardlink
-				if err := os.Link(digestPath, keyPath); err != nil {
-					log.L.Warnf("Failed to create hardlink from digest %q to key %q: %v",
-						opt.chunkDigest, key, err)
-				} else {
-					log.L.Debugf("Created hardlink from digest %q to key %q", opt.chunkDigest, key)
-
-					// Map key to digest
-					internalKey := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", dc.directory, key)))
-					if err := dc.hlManager.MapKeyToDigest(string(internalKey[:]), opt.chunkDigest); err != nil {
-						log.L.Warnf("Failed to map key to digest: %v", err)
-					}
-
-					// Return a no-op writer since the file already exists
-					return &writer{
-						WriteCloser: nopWriteCloser(io.Discard),
-						commitFunc:  func() error { return nil },
-						abortFunc:   func() error { return nil },
-					}, nil
-				}
+		// Try to create a hardlink from existing digest file
+		if dc.hlManager.TryCreateHardlink(key, opt.chunkDigest, keyPath) {
+			// Map key to digest
+			internalKey := dc.hlManager.GenerateInternalKey(dc.directory, key)
+			if err := dc.hlManager.MapKeyToDigest(internalKey, opt.chunkDigest); err != nil {
+				log.L.Warnf("Failed to map key to digest: %v", err)
 			}
+
+			// Return a no-op writer since the file already exists
+			return &writer{
+				WriteCloser: nopWriteCloser(io.Discard),
+				commitFunc:  func() error { return nil },
+				abortFunc:   func() error { return nil },
+			}, nil
 		}
 	}
 
@@ -421,8 +392,8 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 				}
 
 				// Map key to digest
-				internalKey := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", dc.directory, key)))
-				if err := dc.hlManager.MapKeyToDigest(string(internalKey[:]), opt.chunkDigest); err != nil {
+				internalKey := dc.hlManager.GenerateInternalKey(dc.directory, key)
+				if err := dc.hlManager.MapKeyToDigest(internalKey, opt.chunkDigest); err != nil {
 					log.L.Debugf("Failed to map key to digest: %v", err)
 				}
 			}
@@ -540,16 +511,6 @@ func (w *writeCloser) Close() error { return w.closeFunc() }
 
 func nopWriteCloser(w io.Writer) io.WriteCloser {
 	return &writeCloser{w, func() error { return nil }}
-}
-
-// HardlinkCapability represents a cache that supports hardlinking
-type HardlinkCapability interface {
-	// RegisterDigestFile registers a file as the primary source for a digest
-	RegisterDigestFile(chunkDigest string, filepath string) error
-	// GetLinkByDigest returns the file path for a given digest
-	GetLinkByDigest(chunkDigest string) (string, bool)
-	// MapKeyToDigest maps a key to a digest
-	MapKeyToDigest(key string, chunkDigest string) error
 }
 
 // RegisterDigestFile registers a file as the primary source for a digest

@@ -18,6 +18,7 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -505,4 +506,76 @@ func (hm *HardlinkManager) Close() error {
 	close(hm.cleanupDone)
 	// Final persist of any remaining changes
 	return hm.persist()
+}
+
+// HardlinkCapability represents a cache that supports hardlinking
+type HardlinkCapability interface {
+	// RegisterDigestFile registers a file as the primary source for a digest
+	RegisterDigestFile(chunkDigest string, filepath string) error
+	// GetLinkByDigest returns the file path for a given digest
+	GetLinkByDigest(chunkDigest string) (string, bool)
+	// MapKeyToDigest maps a key to a digest
+	MapKeyToDigest(key string, chunkDigest string) error
+	// CreateLink registers a file as the source for a chunkdigest and maps a key to it
+	CreateLink(key string, sourcePath string, chunkdigest string) error
+	// GetLink gets the file path for a key if it exists
+	GetLink(key string) (string, bool)
+}
+
+// TryCreateHardlink attempts to create a hardlink from an existing digest file to a key path
+// Returns true if successful, false otherwise
+func (hm *HardlinkManager) TryCreateHardlink(key string, chunkdigest string, targetPath string) bool {
+	// Try to get existing file for this digest
+	if digestPath, exists := hm.GetLinkByDigest(chunkdigest); exists {
+		// Skip if source and target paths are the same
+		if digestPath != targetPath {
+			// Ensure target directory exists
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+				log.L.Debugf("Failed to create directory for hardlink: %v", err)
+				return false
+			}
+
+			// Remove existing file if any
+			_ = os.Remove(targetPath)
+
+			// Create hardlink
+			if err := os.Link(digestPath, targetPath); err != nil {
+				log.L.Debugf("Failed to create hardlink from digest %q to key %q: %v",
+					chunkdigest, key, err)
+				return false
+			}
+			log.L.Debugf("Created hardlink from digest %q to key %q", chunkdigest, key)
+			return true
+		}
+	}
+	return false
+}
+
+// GenerateInternalKey creates a consistent internal key for a directory and key combination
+func (hm *HardlinkManager) GenerateInternalKey(directory, key string) string {
+	internalKey := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", directory, key)))
+	return fmt.Sprintf("%x", internalKey)
+}
+
+// IsEnabled returns true if the hardlink manager is properly initialized
+func (hm *HardlinkManager) IsEnabled() bool {
+	return hm != nil
+}
+
+// InitializeHardlinkManager creates a hardlink manager for the given cache directory
+// Returns the manager and a boolean indicating if hardlinking is enabled
+func InitializeHardlinkManager(cacheDir string, enableHardlink bool) (*HardlinkManager, bool) {
+	if !enableHardlink {
+		log.L.Infof("Hardlink feature is disabled for cache directory: %q", cacheDir)
+		return nil, false
+	}
+
+	// Get root directory for hardlink manager (../../)
+	hlManager, err := GetGlobalHardlinkManager(cacheDir)
+	if err != nil {
+		log.L.Warnf("Failed to initialize hardlink manager: %v", err)
+		return nil, false
+	}
+	log.L.Infof("Using global hardlink manager with root directory: %q", cacheDir)
+	return hlManager, true
 }
