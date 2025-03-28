@@ -312,6 +312,9 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		ReaderAt: file,
 		closeFunc: func() error {
 			if dc.hlManager != nil && dc.enableHardlink && opt.chunkDigest != "" {
+				if _, exists := dc.hlManager.GetLinkByDigest(opt.chunkDigest); exists {
+					return nil
+				}
 				_, done, added := dc.fileCache.Add(opt.chunkDigest, file)
 				defer done()
 				if !added {

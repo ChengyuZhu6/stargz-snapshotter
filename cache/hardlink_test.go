@@ -59,69 +59,196 @@ func generateTestDigest(content string) string {
 	return fmt.Sprintf("sha256:%x", hash)
 }
 
+// Test RegisterDigestFile and GetLinkByDigest functionality
+func TestHardlinkManager_RegisterAndGetDigest(t *testing.T) {
+	_, _, sourceFile, hlm := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
+
+	t.Run("RegisterAndRetrieveDigest", func(t *testing.T) {
+		// Register the file with a digest
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed: %v", err)
+		}
+
+		// Verify digest is registered
+		filePath, exists := hlm.GetLinkByDigest(testDigest)
+		if !exists {
+			t.Fatal("digest should exist")
+		}
+		if filePath != sourceFile {
+			t.Fatalf("expected file path %q, got %q", sourceFile, filePath)
+		}
+	})
+
+	t.Run("NonExistentFile", func(t *testing.T) {
+		nonExistentFile := filepath.Join(t.TempDir(), "nonexistent.txt")
+		err := hlm.RegisterDigestFile("sha256:nonexistent", nonExistentFile)
+		if err == nil {
+			t.Fatal("should fail with nonexistent file")
+		}
+	})
+
+	t.Run("NonExistentDigest", func(t *testing.T) {
+		_, exists := hlm.GetLinkByDigest("sha256:nonexistent")
+		if exists {
+			t.Fatal("should not find nonexistent digest")
+		}
+	})
+}
+
+// Test MapKeyToDigest and GetLink functionality
+func TestHardlinkManager_MapKeyToDigest(t *testing.T) {
+	_, _, sourceFile, hlm := setupTestEnvironment(t)
+	testDigest := generateTestDigest("test content")
+
+	t.Run("MapKeyAndGetLink", func(t *testing.T) {
+		// First register the digest
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed: %v", err)
+		}
+
+		// Map a key to the digest
+		key := "test-key"
+		if err := hlm.MapKeyToDigest(key, testDigest); err != nil {
+			t.Fatalf("MapKeyToDigest failed: %v", err)
+		}
+
+		// Verify key is mapped to the digest and resolves to the file
+		linkPath, exists := hlm.GetLink(key)
+		if !exists {
+			t.Fatal("link should exist")
+		}
+		if linkPath != sourceFile {
+			t.Fatalf("expected file path %q, got %q", sourceFile, linkPath)
+		}
+	})
+
+	t.Run("NonExistentDigest", func(t *testing.T) {
+		err := hlm.MapKeyToDigest("bad-key", "sha256:nonexistent")
+		if err == nil {
+			t.Fatal("should fail with nonexistent digest")
+		}
+	})
+
+	t.Run("RemappingKey", func(t *testing.T) {
+		// Create another file with different content
+		anotherFile := filepath.Join(t.TempDir(), "another.txt")
+		anotherContent := []byte("different content")
+		if err := os.WriteFile(anotherFile, anotherContent, 0600); err != nil {
+			t.Fatalf("failed to create another file: %v", err)
+		}
+		anotherDigest := generateTestDigest("different content")
+
+		// Register the digest
+		if err := hlm.RegisterDigestFile(anotherDigest, anotherFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed for another digest: %v", err)
+		}
+
+		// Map a key to the first digest
+		key := "remap-test"
+		if err := hlm.MapKeyToDigest(key, testDigest); err != nil {
+			t.Fatalf("MapKeyToDigest failed for first digest: %v", err)
+		}
+
+		// Verify initial mapping
+		linkPath, exists := hlm.GetLink(key)
+		if !exists || linkPath != sourceFile {
+			t.Fatalf("expected link to first file")
+		}
+
+		// Remap the key to the second digest
+		if err := hlm.MapKeyToDigest(key, anotherDigest); err != nil {
+			t.Fatalf("MapKeyToDigest failed for remapping: %v", err)
+		}
+
+		// Verify remapping worked
+		linkPath, exists = hlm.GetLink(key)
+		if !exists || linkPath != anotherFile {
+			t.Fatalf("expected link to be remapped to second file")
+		}
+	})
+}
+
 // Test CreateLink functionality
 func TestHardlinkManager_CreateLink(t *testing.T) {
 	_, _, sourceFile, hlm := setupTestEnvironment(t)
 	testDigest := generateTestDigest("test content")
 
-	t.Run("Success", func(t *testing.T) {
-		key := "test-key"
+	t.Run("CreateLinkSuccess", func(t *testing.T) {
+		key := "create-link-test"
 		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
 			t.Fatalf("CreateLink failed: %v", err)
 		}
 
-		// Verify link exists
-		linkPath, exists := hlm.GetLink(key)
-		if !exists {
-			t.Fatal("link should exist")
+		// Verify both the key-digest mapping and digest-file mapping
+		digestPath, exists := hlm.GetLinkByDigest(testDigest)
+		if !exists || digestPath != sourceFile {
+			t.Fatalf("digest should be mapped to source file")
 		}
 
-		// Verify file
-		sourceStat, err := os.Stat(sourceFile)
-		if err != nil {
-			t.Fatalf("failed to stat source: %v", err)
-		}
-		linkStat, err := os.Stat(linkPath)
-		if err != nil {
-			t.Fatalf("failed to stat link: %v", err)
-		}
-		if !os.SameFile(sourceStat, linkStat) {
-			t.Fatal("files should reference the same inode")
+		// Verify GetLink works
+		linkPath, exists := hlm.GetLink(key)
+		if !exists || linkPath != sourceFile {
+			t.Fatalf("key should resolve to source file")
 		}
 	})
 
-	t.Run("NonExistentSource", func(t *testing.T) {
-		err := hlm.CreateLink("bad-key", "nonexistent", testDigest)
+	t.Run("CreateLinkWithExistingKey", func(t *testing.T) {
+		key := "duplicate-key"
+		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
+			t.Fatalf("First CreateLink failed: %v", err)
+		}
+
+		// Try to create the same key again
+		err := hlm.CreateLink(key, sourceFile, "sha256:different")
 		if err == nil {
-			t.Fatal("should fail with nonexistent source")
+			t.Fatal("should fail when creating link with existing key")
 		}
 	})
 }
 
-// Test GetLink functionality
-func TestHardlinkManager_GetLink(t *testing.T) {
-	_, _, sourceFile, hlm := setupTestEnvironment(t)
+// Test TryCreateHardlink utility function
+func TestHardlinkManager_TryCreateHardlink(t *testing.T) {
+	tmpDir, _, sourceFile, hlm := setupTestEnvironment(t)
 	testDigest := generateTestDigest("test content")
 
-	t.Run("ExistingLink", func(t *testing.T) {
-		key := "get-test"
-		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
-			t.Fatalf("CreateLink failed: %v", err)
+	t.Run("SuccessfulHardlink", func(t *testing.T) {
+		// Register the digest first
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed: %v", err)
 		}
 
-		linkPath, exists := hlm.GetLink(key)
-		if !exists {
-			t.Fatal("link should exist")
+		// Try to create hardlink
+		targetPath := filepath.Join(tmpDir, "hardlink-target.txt")
+		success := hlm.TryCreateHardlink("hardlink-key", testDigest, targetPath)
+		if !success {
+			t.Fatal("TryCreateHardlink should succeed")
 		}
-		if linkPath == "" {
-			t.Fatal("link path should not be empty")
+
+		// Verify hardlink was created
+		sourceStat, err := os.Stat(sourceFile)
+		if err != nil {
+			t.Fatalf("failed to stat source: %v", err)
+		}
+		targetStat, err := os.Stat(targetPath)
+		if err != nil {
+			t.Fatalf("failed to stat target: %v", err)
+		}
+		if !os.SameFile(sourceStat, targetStat) {
+			t.Fatal("files should reference the same inode")
 		}
 	})
 
-	t.Run("NonExistentLink", func(t *testing.T) {
-		_, exists := hlm.GetLink("nonexistent")
-		if exists {
-			t.Fatal("should not find nonexistent link")
+	t.Run("SamePathHardlink", func(t *testing.T) {
+		// Register the digest first
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed: %v", err)
+		}
+
+		// Try to create hardlink to same path
+		success := hlm.TryCreateHardlink("same-path-key", testDigest, sourceFile)
+		if success {
+			t.Fatal("TryCreateHardlink to same path should return false")
 		}
 	})
 }
@@ -144,9 +271,14 @@ func TestHardlinkManager_Cleanup(t *testing.T) {
 	})
 
 	t.Run("UnusedDigest", func(t *testing.T) {
+		// Register and map the digest
+		if err := cleanupHLM.RegisterDigestFile(testDigest, sourceFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed: %v", err)
+		}
+
 		key := "cleanup-test"
-		if err := cleanupHLM.CreateLink(key, sourceFile, testDigest); err != nil {
-			t.Fatalf("CreateLink failed: %v", err)
+		if err := cleanupHLM.MapKeyToDigest(key, testDigest); err != nil {
+			t.Fatalf("MapKeyToDigest failed: %v", err)
 		}
 
 		// Force persist
@@ -190,9 +322,14 @@ func TestHardlinkManager_PersistRestore(t *testing.T) {
 	testDigest := generateTestDigest("test content")
 
 	t.Run("PersistAndRestore", func(t *testing.T) {
+		// Create mappings
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+			t.Fatalf("RegisterDigestFile failed: %v", err)
+		}
+
 		key := "persist-test"
-		if err := hlm.CreateLink(key, sourceFile, testDigest); err != nil {
-			t.Fatalf("CreateLink failed: %v", err)
+		if err := hlm.MapKeyToDigest(key, testDigest); err != nil {
+			t.Fatalf("MapKeyToDigest failed: %v", err)
 		}
 
 		// Force persist
@@ -217,18 +354,17 @@ func TestHardlinkManager_PersistRestore(t *testing.T) {
 		if !exists {
 			t.Fatal("link should be restored")
 		}
+		if linkPath != sourceFile {
+			t.Fatalf("expected file path %q, got %q", sourceFile, linkPath)
+		}
 
-		// Verify file validity
-		sourceStat, err := os.Stat(sourceFile)
-		if err != nil {
-			t.Fatalf("failed to stat source: %v", err)
+		// Verify digest mapping was restored
+		digestPath, exists := hlm2.GetLinkByDigest(testDigest)
+		if !exists {
+			t.Fatal("digest mapping should be restored")
 		}
-		linkStat, err := os.Stat(linkPath)
-		if err != nil {
-			t.Fatalf("failed to stat link: %v", err)
-		}
-		if !os.SameFile(sourceStat, linkStat) {
-			t.Fatal("files should reference the same inode")
+		if digestPath != sourceFile {
+			t.Fatalf("expected digest path %q, got %q", sourceFile, digestPath)
 		}
 	})
 }
@@ -237,6 +373,11 @@ func TestHardlinkManager_PersistRestore(t *testing.T) {
 func TestHardlinkManager_Concurrent(t *testing.T) {
 	_, _, sourceFile, hlm := setupTestEnvironment(t)
 	testDigest := generateTestDigest("test content")
+
+	// Register the digest first
+	if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+		t.Fatalf("RegisterDigestFile failed: %v", err)
+	}
 
 	done := make(chan bool)
 	timeout := time.After(10 * time.Second)
@@ -250,7 +391,8 @@ func TestHardlinkManager_Concurrent(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			hlm.CreateLink("test-key"+string(rune(i)), sourceFile, testDigest)
+			key := fmt.Sprintf("test-key-%d", i)
+			hlm.MapKeyToDigest(key, testDigest)
 		}
 		done <- true
 	}()
@@ -263,6 +405,37 @@ func TestHardlinkManager_Concurrent(t *testing.T) {
 			t.Fatal("concurrent test timed out")
 		}
 	}
+}
+
+// Test utility functions
+func TestHardlinkManager_UtilityFunctions(t *testing.T) {
+	_, _, _, hlm := setupTestEnvironment(t)
+
+	t.Run("GenerateInternalKey", func(t *testing.T) {
+		key1 := hlm.GenerateInternalKey("/path/to/dir", "key1")
+		key2 := hlm.GenerateInternalKey("/path/to/dir", "key2")
+
+		if key1 == key2 {
+			t.Fatal("different keys should generate different internal keys")
+		}
+
+		// Same inputs should generate same output
+		key1Again := hlm.GenerateInternalKey("/path/to/dir", "key1")
+		if key1 != key1Again {
+			t.Fatal("same inputs should generate same internal key")
+		}
+	})
+
+	t.Run("IsEnabled", func(t *testing.T) {
+		if !hlm.IsEnabled() {
+			t.Fatal("hardlink manager should be enabled")
+		}
+
+		var nilManager *HardlinkManager
+		if nilManager.IsEnabled() {
+			t.Fatal("nil manager should report as disabled")
+		}
+	})
 }
 
 // Test disabled hardlink functionality

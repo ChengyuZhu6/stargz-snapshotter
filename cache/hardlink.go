@@ -91,7 +91,7 @@ func NewHardlinkManager(root string) (*HardlinkManager, error) {
 	}
 
 	// Start periodic cleanup and persistence
-	// go hm.periodicCleanup()
+	go hm.periodicCleanup()
 	go hm.persistWorker()
 
 	return hm, nil
