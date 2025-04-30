@@ -475,7 +475,7 @@ diff --no-dereference -qr "${USR_NORMALSN_PLAIN_STARGZ}/" "${USR_STARGZSN_PLAIN_
 # Try to pull this image from different namespace.
 ctr-remote --namespace=dummy images rpull --user "${DUMMYUSER}:${DUMMYPASS}" \
            "${REGISTRY_HOST}/ubuntu:esgz"
-
+echo ""
 ############
 # Test for starting when no configuration file.
 mv /etc/containerd-stargz-grpc/config.toml /etc/containerd-stargz-grpc/config.toml_rm
