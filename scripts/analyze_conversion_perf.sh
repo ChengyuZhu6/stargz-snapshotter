@@ -56,6 +56,12 @@ echo "=== 转换成功率 ==="
 echo "成功: $SUCCESSFUL"
 echo "失败: $FAILED"
 echo "成功率: ${SUCCESS_RATE}%"
+
+# 按转换器类型统计
+ESTARGZ_COUNT=$(jq -r 'select(.success == true and (.converter // "estargz") == "estargz") | .digest' "$TMPFILE" | wc -l)
+ZSTDCHUNKED_COUNT=$(jq -r 'select(.success == true and .converter == "zstdchunked") | .digest' "$TMPFILE" | wc -l)
+echo "  - eStargz: $ESTARGZ_COUNT"
+echo "  - ZstdChunked: $ZSTDCHUNKED_COUNT"
 echo
 
 # 总体耗时统计
@@ -76,27 +82,54 @@ echo
 
 # 各阶段耗时分析
 echo "=== 各阶段平均耗时 (毫秒) ==="
+echo "--- eStargz 转换器 ---"
 for stage in layer_type_check get_content_info create_reader build_estargz prepare_writer data_copy update_commit build_descriptor; do
-    avg=$(jq -r "select(.success == true) | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1; count++} END {if(count > 0) print sum/count; else print 0}')
+    avg=$(jq -r "select(.success == true and (.converter // \"estargz\") == \"estargz\") | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1; count++} END {if(count > 0) print sum/count; else print 0}')
+    printf "%-20s: %8.2f ms\n" "$stage" "$avg"
+done
+
+echo "--- ZstdChunked 转换器 ---"
+for stage in layer_type_check uncompress_layer get_content_info create_reader build_zstdchunked prepare_writer data_copy update_commit build_descriptor; do
+    avg=$(jq -r "select(.success == true and .converter == \"zstdchunked\") | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1; count++} END {if(count > 0) print sum/count; else print 0}')
     printf "%-20s: %8.2f ms\n" "$stage" "$avg"
 done
 echo
 
 # 各阶段总耗时分析
 echo "=== 各阶段总耗时 (毫秒) ==="
+echo "--- eStargz 转换器 ---"
 for stage in layer_type_check get_content_info create_reader build_estargz prepare_writer data_copy update_commit build_descriptor; do
-    total=$(jq -r "select(.success == true) | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1} END {print sum}')
+    total=$(jq -r "select(.success == true and (.converter // \"estargz\") == \"estargz\") | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1} END {print sum}')
+    printf "%-20s: %8.2f ms\n" "$stage" "$total"
+done
+
+echo "--- ZstdChunked 转换器 ---"
+for stage in layer_type_check uncompress_layer get_content_info create_reader build_zstdchunked prepare_writer data_copy update_commit build_descriptor; do
+    total=$(jq -r "select(.success == true and .converter == \"zstdchunked\") | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1} END {print sum}')
     printf "%-20s: %8.2f ms\n" "$stage" "$total"
 done
 echo
 
 # 阶段耗时占比分析
 echo "=== 各阶段耗时占比 ==="
-TOTAL_ALL_STAGES=$(jq -r 'select(.success == true) | .total_duration_ms' "$TMPFILE" | awk '{sum += $1} END {print sum}')
+echo "--- eStargz 转换器 ---"
+TOTAL_ESTARGZ_STAGES=$(jq -r 'select(.success == true and (.converter // "estargz") == "estargz") | .total_duration_ms' "$TMPFILE" | awk '{sum += $1} END {print sum}')
 for stage in layer_type_check get_content_info create_reader build_estargz prepare_writer data_copy update_commit build_descriptor; do
-    total=$(jq -r "select(.success == true) | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1} END {print sum}')
-    if (( $(echo "$TOTAL_ALL_STAGES > 0" | bc -l) )); then
-        percentage=$(echo "scale=2; $total * 100 / $TOTAL_ALL_STAGES" | bc -l)
+    total=$(jq -r "select(.success == true and (.converter // \"estargz\") == \"estargz\") | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1} END {print sum}')
+    if (( $(echo "$TOTAL_ESTARGZ_STAGES > 0" | bc -l) )); then
+        percentage=$(echo "scale=2; $total * 100 / $TOTAL_ESTARGZ_STAGES" | bc -l)
+        printf "%-20s: %8.2f ms (%5.1f%%)\n" "$stage" "$total" "$percentage"
+    else
+        printf "%-20s: %8.2f ms\n" "$stage" "$total"
+    fi
+done
+
+echo "--- ZstdChunked 转换器 ---"
+TOTAL_ZSTDCHUNKED_STAGES=$(jq -r 'select(.success == true and .converter == "zstdchunked") | .total_duration_ms' "$TMPFILE" | awk '{sum += $1} END {print sum}')
+for stage in layer_type_check uncompress_layer get_content_info create_reader build_zstdchunked prepare_writer data_copy update_commit build_descriptor; do
+    total=$(jq -r "select(.success == true and .converter == \"zstdchunked\") | .stages.${stage} // 0" "$TMPFILE" | awk '{sum += $1} END {print sum}')
+    if (( $(echo "$TOTAL_ZSTDCHUNKED_STAGES > 0" | bc -l) )); then
+        percentage=$(echo "scale=2; $total * 100 / $TOTAL_ZSTDCHUNKED_STAGES" | bc -l)
         printf "%-20s: %8.2f ms (%5.1f%%)\n" "$stage" "$total" "$percentage"
     else
         printf "%-20s: %8.2f ms\n" "$stage" "$total"

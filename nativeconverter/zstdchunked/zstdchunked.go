@@ -18,8 +18,10 @@ package zstdchunked
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
@@ -94,39 +96,87 @@ func LayerConvertWithLayerOptsFuncWithCompressionLevel(compressionLevel zstd.Enc
 // LayerConvertFunc is that this allows configuring the compression level.
 func LayerConvertFuncWithCompressionLevel(compressionLevel zstd.EncoderLevel, opts ...estargz.Option) converter.ConvertFunc {
 	return func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
+		totalStart := time.Now()
+
+		// Performance tracking structure
+		stages := make(map[string]float64)
+		perfData := map[string]interface{}{
+			"digest":            desc.Digest.String(),
+			"original_size":     desc.Size,
+			"timestamp":         totalStart.Format(time.RFC3339),
+			"converter":         "zstdchunked",
+			"compression_level": int(compressionLevel),
+			"stages":            stages,
+		}
+
+		// Step 1: Check if it's a layer type
+		stepStart := time.Now()
 		if !images.IsLayerType(desc.MediaType) {
-			// No conversion. No need to return an error here.
+			stages["layer_type_check"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["reason"] = "not_layer_type"
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, nil
 		}
+		stages["layer_type_check"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+
+		// Step 2: Handle uncompression if needed
+		stepStart = time.Now()
 		uncompressedDesc := &desc
 		// We need to uncompress the archive first
 		if !uncompress.IsUncompressedType(desc.MediaType) {
 			var err error
 			uncompressedDesc, err = uncompress.LayerConvertFunc(ctx, cs, desc)
 			if err != nil {
+				stages["uncompress_layer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+				perfData["success"] = false
+				perfData["error"] = err.Error()
+				fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 				return nil, err
 			}
 			if uncompressedDesc == nil {
+				stages["uncompress_layer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+				perfData["success"] = false
+				perfData["error"] = "unexpectedly got the same blob after compression"
+				fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 				return nil, fmt.Errorf("unexpectedly got the same blob after compression (%s, %q)", desc.Digest, desc.MediaType)
 			}
 			log.G(ctx).Debugf("zstdchunked: uncompressed %s into %s", desc.Digest, uncompressedDesc.Digest)
 		}
+		stages["uncompress_layer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
+		// Step 3: Get content info
+		stepStart = time.Now()
 		info, err := cs.Info(ctx, desc.Digest)
 		if err != nil {
+			stages["get_content_info"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		labelz := info.Labels
 		if labelz == nil {
 			labelz = make(map[string]string)
 		}
+		stages["get_content_info"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
+		// Step 4: Create reader
+		stepStart = time.Now()
 		uncompressedReaderAt, err := cs.ReaderAt(ctx, *uncompressedDesc)
 		if err != nil {
+			stages["create_reader"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		defer uncompressedReaderAt.Close()
 		uncompressedSR := io.NewSectionReader(uncompressedReaderAt, 0, uncompressedDesc.Size)
+		stages["create_reader"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+
+		// Step 5: Build zstdchunked
+		stepStart = time.Now()
 		metadata := make(map[string]string)
 		opts = append(opts, estargz.WithCompression(&zstdCompression{
 			new(zstdchunked.Decompressor),
@@ -137,24 +187,40 @@ func LayerConvertFuncWithCompressionLevel(compressionLevel zstd.EncoderLevel, op
 		}))
 		blob, err := estargz.Build(uncompressedSR, append(opts, estargz.WithContext(ctx))...)
 		if err != nil {
+			stages["build_zstdchunked"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		defer blob.Close()
+		stages["build_zstdchunked"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+
+		// Step 6: Prepare writer
+		stepStart = time.Now()
 		ref := fmt.Sprintf("convert-zstdchunked-from-%s", desc.Digest)
 		w, err := content.OpenWriter(ctx, cs, content.WithRef(ref))
 		if err != nil {
+			stages["prepare_writer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		defer w.Close()
 
 		// Reset the writing position
-		// Old writer possibly remains without aborted
-		// (e.g. conversion interrupted by a signal)
 		if err := w.Truncate(0); err != nil {
+			stages["prepare_writer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
+		stages["prepare_writer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
-		// Copy and count the contents
+		// Step 7: Data copy and decompression
+		stepStart = time.Now()
 		pr, pw := io.Pipe()
 		c := new(ioutils.CountWriter)
 		doneCount := make(chan struct{})
@@ -172,24 +238,58 @@ func LayerConvertFuncWithCompressionLevel(compressionLevel zstd.EncoderLevel, op
 				return
 			}
 		}()
+
+		copyStart := time.Now()
 		n, err := io.Copy(w, io.TeeReader(blob, pw))
 		if err != nil {
+			stages["data_copy"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
+		copyDuration := time.Since(copyStart)
+
 		if err := blob.Close(); err != nil {
 			return nil, err
 		}
+		if err := pw.Close(); err != nil {
+			return nil, err
+		}
+		<-doneCount
+
+		stages["data_copy"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+		perfData["pure_copy_ms"] = float64(copyDuration.Nanoseconds()) / 1e6
+
+		// Step 8: Update metadata and commit
+		stepStart = time.Now()
 		// update diffID label
 		labelz[labels.LabelUncompressed] = blob.DiffID().String()
 		if err = w.Commit(ctx, n, "", content.WithLabels(labelz)); err != nil && !errdefs.IsAlreadyExists(err) {
+			stages["update_commit"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		if err := w.Close(); err != nil {
+			stages["update_commit"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
+		stages["update_commit"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+
+		// Step 9: Build new descriptor
+		stepStart = time.Now()
 		newDesc := desc
 		newDesc.MediaType, err = convertMediaTypeToZstd(newDesc.MediaType)
 		if err != nil {
+			stages["build_descriptor"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		newDesc.Digest = w.Digest()
@@ -206,6 +306,18 @@ func LayerConvertFuncWithCompressionLevel(compressionLevel zstd.EncoderLevel, op
 		if p, ok := metadata[zstdchunked.ManifestPositionAnnotation]; ok {
 			newDesc.Annotations[zstdchunked.ManifestPositionAnnotation] = p
 		}
+		stages["build_descriptor"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+
+		// Final metrics
+		totalDuration := time.Since(totalStart)
+		perfData["total_duration_ms"] = float64(totalDuration.Nanoseconds()) / 1e6
+		perfData["compressed_size"] = n
+		perfData["compression_ratio"] = float64(n) / float64(desc.Size) * 100
+		perfData["success"] = true
+
+		// Output performance data as JSON
+		fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
+
 		return &newDesc, nil
 	}
 }
@@ -221,4 +333,13 @@ func convertMediaTypeToZstd(mt string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown mediatype %q", mt)
 	}
+}
+
+// mustMarshalJSON marshals data to JSON, returns empty object on error
+func mustMarshalJSON(data interface{}) string {
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return "{}"
+	}
+	return string(bytes)
 }
