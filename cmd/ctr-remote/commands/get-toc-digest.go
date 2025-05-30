@@ -23,6 +23,7 @@ import (
 	"io"
 
 	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/containerd/stargz-snapshotter/estargz/zstdchunked"
 	digest "github.com/opencontainers/go-digest"
@@ -104,7 +105,8 @@ var GetTOCDigestCommand = &cli.Command{
 			fmt.Println(string(tocJSON))
 			return nil
 		}
-		fmt.Println(tocDgst.String())
+		log.G(ctx).Infof("TOC digest: %s", tocDgst.String())
+		// fmt.Println(tocDgst.String())
 		return nil
 	},
 }

@@ -18,6 +18,7 @@ package estargz
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"time"
@@ -61,65 +62,94 @@ func LayerConvertWithLayerAndCommonOptsFunc(opts map[digest.Digest][]estargz.Opt
 func LayerConvertFunc(opts ...estargz.Option) converter.ConvertFunc {
 	return func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
 		totalStart := time.Now()
-		log.G(ctx).Infof("Starting layer conversion for digest: %s", desc.Digest)
+
+		// Performance tracking structure
+		stages := make(map[string]float64)
+		perfData := map[string]interface{}{
+			"digest":        desc.Digest.String(),
+			"original_size": desc.Size,
+			"timestamp":     totalStart.Format(time.RFC3339),
+			"stages":        stages,
+		}
 
 		// Step 1: Check if it's a layer type
 		stepStart := time.Now()
 		if !images.IsLayerType(desc.MediaType) {
-			log.G(ctx).Infof("Step 1 (Layer type check): %v - Not a layer type, skipping conversion", time.Since(stepStart))
+			stages["layer_type_check"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6 // milliseconds
+			perfData["success"] = false
+			perfData["reason"] = "not_layer_type"
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, nil
 		}
-		log.G(ctx).Infof("Step 1 (Layer type check): %v - Layer type confirmed", time.Since(stepStart))
+		stages["layer_type_check"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
 		// Step 2: Get content info
 		stepStart = time.Now()
 		info, err := cs.Info(ctx, desc.Digest)
 		if err != nil {
+			stages["get_content_info"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		labelz := info.Labels
 		if labelz == nil {
 			labelz = make(map[string]string)
 		}
-		log.G(ctx).Infof("Step 2 (Get content info): %v", time.Since(stepStart))
+		stages["get_content_info"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
 		// Step 3: Create reader
 		stepStart = time.Now()
 		ra, err := cs.ReaderAt(ctx, desc)
 		if err != nil {
+			stages["create_reader"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		defer ra.Close()
 		sr := io.NewSectionReader(ra, 0, desc.Size)
-		log.G(ctx).Infof("Step 3 (Create reader): %v", time.Since(stepStart))
+		stages["create_reader"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
 		// Step 4: Build eStargz
 		stepStart = time.Now()
 		blob, err := estargz.Build(sr, append(opts, estargz.WithContext(ctx))...)
 		if err != nil {
+			stages["build_estargz"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		defer blob.Close()
-		log.G(ctx).Infof("Step 4 (Build eStargz): %v", time.Since(stepStart))
+		stages["build_estargz"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
 		// Step 5: Prepare writer
 		stepStart = time.Now()
 		ref := fmt.Sprintf("convert-estargz-from-%s", desc.Digest)
 		w, err := content.OpenWriter(ctx, cs, content.WithRef(ref))
 		if err != nil {
+			stages["prepare_writer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		defer w.Close()
 
 		// Reset the writing position
-		// Old writer possibly remains without aborted
-		// (e.g. conversion interrupted by a signal)
 		if err := w.Truncate(0); err != nil {
+			stages["prepare_writer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
-		log.G(ctx).Infof("Step 5 (Prepare writer): %v", time.Since(stepStart))
+		stages["prepare_writer"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
-		// Step 6: Setup concurrent processing for copy and decompression counting
+		// Step 6: Data copy and decompression
 		stepStart = time.Now()
 		pr, pw := io.Pipe()
 		c := new(ioutils.CountWriter)
@@ -139,10 +169,13 @@ func LayerConvertFunc(opts ...estargz.Option) converter.ConvertFunc {
 			}
 		}()
 
-		// Copy data and measure
 		copyStart := time.Now()
 		n, err := io.Copy(w, io.TeeReader(blob, pw))
 		if err != nil {
+			stages["data_copy"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		copyDuration := time.Since(copyStart)
@@ -154,18 +187,28 @@ func LayerConvertFunc(opts ...estargz.Option) converter.ConvertFunc {
 			return nil, err
 		}
 		<-doneCount
-		log.G(ctx).Infof("Step 6 (Data copy and decompression): %v (pure copy: %v)", time.Since(stepStart), copyDuration)
+
+		stages["data_copy"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+		perfData["pure_copy_ms"] = float64(copyDuration.Nanoseconds()) / 1e6
 
 		// Step 7: Update metadata and commit
 		stepStart = time.Now()
 		labelz[labels.LabelUncompressed] = blob.DiffID().String()
 		if err = w.Commit(ctx, n, "", content.WithLabels(labelz)); err != nil && !errdefs.IsAlreadyExists(err) {
+			stages["update_commit"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
 		if err := w.Close(); err != nil {
+			stages["update_commit"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
+			perfData["success"] = false
+			perfData["error"] = err.Error()
+			log.G(ctx).Infof("PERF_DATA: %s", mustMarshalJSON(perfData))
 			return nil, err
 		}
-		log.G(ctx).Infof("Step 7 (Update metadata and commit): %v", time.Since(stepStart))
+		stages["update_commit"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
 		// Step 8: Build new descriptor
 		stepStart = time.Now()
@@ -184,12 +227,27 @@ func LayerConvertFunc(opts ...estargz.Option) converter.ConvertFunc {
 		}
 		newDesc.Annotations[estargz.TOCJSONDigestAnnotation] = blob.TOCDigest().String()
 		newDesc.Annotations[estargz.StoreUncompressedSizeAnnotation] = fmt.Sprintf("%d", c.Size())
-		log.G(ctx).Infof("Step 8 (Build new descriptor): %v", time.Since(stepStart))
+		stages["build_descriptor"] = float64(time.Since(stepStart).Nanoseconds()) / 1e6
 
+		// Final metrics
 		totalDuration := time.Since(totalStart)
-		log.G(ctx).Infof("Layer conversion completed in %v. Original size: %d, New size: %d, Compression ratio: %.2f%%",
-			totalDuration, desc.Size, n, float64(n)/float64(desc.Size)*100)
+		perfData["total_duration_ms"] = float64(totalDuration.Nanoseconds()) / 1e6
+		perfData["compressed_size"] = n
+		perfData["compression_ratio"] = float64(n) / float64(desc.Size) * 100
+		perfData["success"] = true
+
+		// Output performance data as JSON
+		fmt.Println("PERF_DATA:", mustMarshalJSON(perfData))
 
 		return &newDesc, nil
 	}
+}
+
+// mustMarshalJSON marshals data to JSON, returns empty object on error
+func mustMarshalJSON(data interface{}) string {
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return "{}"
+	}
+	return string(bytes)
 }
