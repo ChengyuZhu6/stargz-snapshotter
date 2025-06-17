@@ -33,6 +33,8 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -431,6 +433,18 @@ type file struct {
 // as possible from the cache.
 func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 	fmt.Println("!!!!!!!!!!!!!!!! ReadAt = ", offset, "; len(p) = ", len(p))
+
+	// 获取函数开始时的内存基准
+	baseline := getMemSnapshot()
+	fmt.Printf("========== ReadAt Function Memory Tracking ==========\n")
+	fmt.Printf("Baseline captured for offset:%d, len:%d\n", offset, len(p))
+
+	// 确保在函数返回时打印最终的内存变化
+	defer func() {
+		printMemUsageWithBaseline(fmt.Sprintf("ReadAt FINAL - offset:%d, len:%d", offset, len(p)), &baseline)
+		fmt.Printf("========== ReadAt Function Memory Tracking END ==========\n")
+	}()
+
 	nr := 0
 	for nr < len(p) {
 		chunkOffset, chunkSize, chunkDigestStr, _, ok := sf.fr.ChunkEntryForOffset(offset + int64(nr))
@@ -446,10 +460,14 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 		fmt.Println("!!!!!!!!!!!!!!!! chunkOffset = ", chunkOffset, "; chunkSize = ", chunkSize, "; upperDiscard = ", upperDiscard, "; lowerDiscard = ", lowerDiscard, "; expectedSize = ", expectedSize)
 		// Check if the content exists in the cache
 		if r, err := sf.gr.cache.Get(id, cache.ChunkDigest(chunkDigestStr)); err == nil {
+			printMemUsageWithBaseline(fmt.Sprintf("Cache hit - expectedSize:%d", expectedSize), &baseline)
+
 			n, err := r.ReadAt(p[nr:int64(nr)+expectedSize], lowerDiscard)
 			if (err == nil || err == io.EOF) && int64(n) == expectedSize {
 				nr += n
 				r.Close()
+
+				printMemUsageWithBaseline(fmt.Sprintf("Cache read completed - expectedSize:%d", expectedSize), &baseline)
 				continue
 			}
 			r.Close()
@@ -460,6 +478,8 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 		// reads against neighboring chunks can take the data without decmpression.
 		if lowerDiscard == 0 && upperDiscard == 0 {
 			// We can directly store the result to the given buffer
+			printMemUsageWithBaseline(fmt.Sprintf("Direct read path - chunkSize:%d", chunkSize), &baseline)
+
 			ip := p[nr : int64(nr)+chunkSize]
 			n, err := sf.fr.ReadAt(ip, chunkOffset)
 			if err != nil && err != io.EOF {
@@ -468,25 +488,44 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			if err := sf.gr.verifyAndCache(sf.id, ip, chunkDigestStr, id); err != nil {
 				return 0, err
 			}
+
+			printMemUsageWithBaseline(fmt.Sprintf("Direct read completed - chunkSize:%d", chunkSize), &baseline)
+
 			nr += n
 			continue
 		}
 
 		// Use temporally buffer for aligning this chunk
+		printMemUsageWithBaseline(fmt.Sprintf("Before buffer allocation - chunkSize:%d", chunkSize), &baseline)
+
 		b := sf.gr.bufPool.Get().(*bytes.Buffer)
+		trackBufferUsage("After bufPool.Get()", b, &baseline)
+
 		b.Reset()
 		b.Grow(int(chunkSize))
 		ip := b.Bytes()[:chunkSize]
+
+		trackBufferUsage(fmt.Sprintf("After buffer Grow(%d)", chunkSize), b, &baseline)
+
 		if _, err := sf.fr.ReadAt(ip, chunkOffset); err != nil && err != io.EOF {
 			sf.gr.putBuffer(b)
 			return 0, fmt.Errorf("failed to read data: %w", err)
 		}
+
+		trackBufferUsage("After ReadAt to buffer", b, &baseline)
+
 		if err := sf.gr.verifyAndCache(sf.id, ip, chunkDigestStr, id); err != nil {
 			sf.gr.putBuffer(b)
 			return 0, err
 		}
+
+		trackBufferUsage("After verifyAndCache", b, &baseline)
+
 		n := copy(p[nr:], ip[lowerDiscard:chunkSize-upperDiscard])
 		sf.gr.putBuffer(b)
+
+		printMemUsageWithBaseline(fmt.Sprintf("After buffer putback - copied %d bytes", n), &baseline)
+
 		if int64(n) != expectedSize {
 			return 0, fmt.Errorf("unexpected final data size %d; want %d", n, expectedSize)
 		}
@@ -819,4 +858,147 @@ func digestVerifier(id uint32, chunkDigestStr string) (digest.Verifier, error) {
 		return nil, fmt.Errorf("invalid chunk: no digest is recorded(len=%d): %w", len(chunkDigestStr), err)
 	}
 	return chunkDigest.Verifier(), nil
+}
+
+// printMemUsage 打印当前内存使用情况
+func printMemUsage(label string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// Convert bytes to MB for better readability
+	fmt.Printf("========== Memory Usage [%s] ==========\n", label)
+	fmt.Printf("Alloc = %d MB", bToMb(m.Alloc))
+	fmt.Printf(", TotalAlloc = %d MB", bToMb(m.TotalAlloc))
+	fmt.Printf(", Sys = %d MB", bToMb(m.Sys))
+	fmt.Printf(", NumGC = %d\n", m.NumGC)
+	fmt.Printf("HeapAlloc = %d MB", bToMb(m.HeapAlloc))
+	fmt.Printf(", HeapSys = %d MB", bToMb(m.HeapSys))
+	fmt.Printf(", HeapIdle = %d MB", bToMb(m.HeapIdle))
+	fmt.Printf(", HeapInuse = %d MB\n", bToMb(m.HeapInuse))
+	fmt.Printf("StackInuse = %d MB", bToMb(m.StackInuse))
+	fmt.Printf(", StackSys = %d MB\n", bToMb(m.StackSys))
+
+	// 读取系统内存信息 (Linux /proc/meminfo)
+	if sysMemInfo := getSystemMemInfo(); sysMemInfo != "" {
+		fmt.Printf("---------- System Memory Info ----------\n")
+		fmt.Print(sysMemInfo)
+	}
+
+	fmt.Printf("==========================================\n")
+}
+
+// printMemUsageWithBaseline 打印相对于基准的内存使用变化
+func printMemUsageWithBaseline(label string, baseline *runtime.MemStats) {
+	// 强制执行GC以获得更准确的内存状态
+	runtime.GC()
+	runtime.GC() // 执行两次确保清理完成
+
+	var current runtime.MemStats
+	runtime.ReadMemStats(&current)
+
+	fmt.Printf("========== Memory Delta [%s] ==========\n", label)
+	fmt.Printf("Alloc Delta = %+d KB", int64(current.Alloc)-int64(baseline.Alloc))
+	fmt.Printf(", HeapInuse Delta = %+d KB", int64(current.HeapInuse)-int64(baseline.HeapInuse))
+	fmt.Printf(", Sys Delta = %+d KB\n", int64(current.Sys)-int64(baseline.Sys))
+	fmt.Printf("TotalAlloc Delta = %+d KB", int64(current.TotalAlloc)-int64(baseline.TotalAlloc))
+	fmt.Printf(", NumGC Delta = %+d\n", int64(current.NumGC)-int64(baseline.NumGC))
+
+	// 也打印系统内存变化
+	if sysMemInfo := getSystemMemInfo(); sysMemInfo != "" {
+		fmt.Printf("---------- Current System Memory ----------\n")
+		fmt.Print(sysMemInfo)
+	}
+
+	fmt.Printf("============================================\n")
+}
+
+// getMemSnapshot 获取当前内存快照
+func getMemSnapshot() runtime.MemStats {
+	runtime.GC()
+	runtime.GC() // 执行两次GC确保清理
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m
+}
+
+// trackBufferUsage 跟踪缓冲区的实际使用情况
+func trackBufferUsage(label string, buffer *bytes.Buffer, baseline *runtime.MemStats) {
+	var current runtime.MemStats
+	runtime.ReadMemStats(&current)
+
+	bufferSize := 0
+	bufferCap := 0
+	if buffer != nil {
+		bufferSize = buffer.Len()
+		bufferCap = buffer.Cap()
+	}
+
+	fmt.Printf("========== Buffer Usage [%s] ==========\n", label)
+	fmt.Printf("Buffer Len = %d bytes, Cap = %d bytes\n", bufferSize, bufferCap)
+	fmt.Printf("Alloc Delta = %+d bytes", int64(current.Alloc)-int64(baseline.Alloc))
+	fmt.Printf(", HeapInuse Delta = %+d bytes\n", int64(current.HeapInuse)-int64(baseline.HeapInuse))
+	fmt.Printf("Buffer Cap vs Alloc Delta ratio = %.2f\n",
+		float64(bufferCap)/float64(int64(current.Alloc)-int64(baseline.Alloc)+1)) // +1 避免除零
+	fmt.Printf("==========================================\n")
+}
+
+// bToMb 将字节转换为MB
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
+}
+
+// getSystemMemInfo 获取Linux系统内存信息，类似于 cat /proc/meminfo | grep -E "Cached|Buffers|SReclaimable|Active\(file\)|Inactive\(file\)"
+func getSystemMemInfo() string {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return fmt.Sprintf("Failed to read /proc/meminfo: %v\n", err)
+	}
+	defer file.Close()
+
+	var result strings.Builder
+	scanner := bufio.NewScanner(file)
+
+	// 需要匹配的内存信息项
+	targets := []string{"Cached:", "Buffers:", "SReclaimable:", "Active(file):", "Inactive(file):"}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		for _, target := range targets {
+			if strings.HasPrefix(line, target) {
+				// 解析数值并转换为MB
+				if memInfo := parseMemInfoLine(line); memInfo != "" {
+					result.WriteString(memInfo)
+					result.WriteString("\n")
+				}
+				break
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Sprintf("Error reading /proc/meminfo: %v\n", err)
+	}
+
+	return result.String()
+}
+
+// parseMemInfoLine 解析 /proc/meminfo 中的一行，将kB转换为MB
+func parseMemInfoLine(line string) string {
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return line
+	}
+
+	name := parts[0]
+	valueStr := parts[1]
+
+	// 转换为数值 (kB)
+	valueKB, err := strconv.ParseUint(valueStr, 10, 64)
+	if err != nil {
+		return line // 如果解析失败，返回原始行
+	}
+
+	// 格式化输出
+	return fmt.Sprintf("%s %d KB", name, valueKB)
 }
