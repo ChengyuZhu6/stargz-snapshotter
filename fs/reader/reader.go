@@ -238,7 +238,7 @@ func (vr *VerifiableReader) readAndCache(id uint32, fr io.Reader, chunkOffset, c
 
 	// Check if it already exists in the cache
 	cacheID := genID(id, chunkOffset, chunkSize)
-	if r, err := gr.cache.Get(cacheID); err == nil {
+	if r, err := gr.cache.Get(cacheID, cache.ChunkDigest(chunkDigest)); err == nil {
 		r.Close()
 		return nil
 	}
@@ -444,7 +444,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 		)
 
 		// Check if the content exists in the cache
-		if r, err := sf.gr.cache.Get(id); err == nil {
+		if r, err := sf.gr.cache.Get(id, cache.ChunkDigest(chunkDigestStr)); err == nil {
 			n, err := r.ReadAt(p[nr:int64(nr)+expectedSize], lowerDiscard)
 			if (err == nil || err == io.EOF) && int64(n) == expectedSize {
 				nr += n
