@@ -29,6 +29,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -581,6 +582,111 @@ func (l *layer) backgroundFetch(ctx context.Context) error {
 	if l.isClosed() {
 		return fmt.Errorf("layer is already closed")
 	}
+
+	// Check if we can use the new TOC-based background fetch
+	if l.canUseTOCBasedFetch() {
+		return l.backgroundFetchWithTOC(ctx)
+	}
+
+	// Fall back to the original implementation
+	return l.backgroundFetchOriginal(ctx)
+}
+
+// canUseTOCBasedFetch checks if the layer supports TOC-based fetching
+func (l *layer) canUseTOCBasedFetch() bool {
+	// Check if we have metadata reader and blob available
+	return l.verifiableReader != nil && l.blob != nil
+}
+
+// backgroundFetchWithTOC implements chunk-level background fetch using TOC information
+func (l *layer) backgroundFetchWithTOC(ctx context.Context) error {
+	log.G(ctx).Debug("starting TOC-based background fetch")
+
+	// Get all chunks from the metadata
+	chunks, err := l.getAllChunksFromTOC()
+	if err != nil {
+		log.G(ctx).WithError(err).Debug("failed to get chunks from TOC, falling back to original method")
+		return l.backgroundFetchOriginal(ctx)
+	}
+
+	if len(chunks) == 0 {
+		log.G(ctx).Debug("no chunks found in TOC")
+		return nil
+	}
+
+	// Sort chunks by offset for sequential access
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].Offset < chunks[j].Offset
+	})
+
+	log.G(ctx).Debugf("found %d chunks in TOC for background fetch", len(chunks))
+
+	// Process chunks in batches to avoid overwhelming the system
+	const maxConcurrentChunks = 10
+	sem := make(chan struct{}, maxConcurrentChunks)
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var firstErrOnce sync.Once
+
+	for _, chunk := range chunks {
+		// Check if we should stop due to error or closure
+		if l.isClosed() {
+			return fmt.Errorf("layer is already closed")
+		}
+
+		if firstErr != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(c layerChunkInfo) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Invoke background task with timeout
+			l.resolver.backgroundTaskManager.InvokeBackgroundTask(func(bgCtx context.Context) {
+				defer commonmetrics.MeasureLatencyInMilliseconds(commonmetrics.BackgroundFetchDownload, l.Info().Digest, time.Now())
+
+				// Check if this chunk is already in cache (with digest-based lookup)
+				cacheOpts := []remote.Option{
+					remote.WithContext(bgCtx),
+					remote.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
+				}
+
+				// Add chunk digest for hardlink-based deduplication
+				if c.ChunkDigest != "" {
+					cacheOpts = append(cacheOpts, remote.WithCacheOpts(cache.ChunkDigest(c.ChunkDigest)))
+				}
+
+				// Try to cache this specific chunk
+				if err := l.blob.Cache(c.Offset, c.ChunkSize, cacheOpts...); err != nil {
+					firstErrOnce.Do(func() {
+						firstErr = fmt.Errorf("failed to cache chunk at offset %d: %w", c.Offset, err)
+					})
+				}
+			}, 120*time.Second)
+		}(chunk)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+
+	// Cache uncompressed data using the reader interface
+	defer commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.BackgroundFetchDecompress, time.Now())
+	return l.verifiableReader.Cache(
+		reader.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
+	)
+}
+
+// backgroundFetchOriginal implements the original background fetch method
+func (l *layer) backgroundFetchOriginal(ctx context.Context) error {
 	br := io.NewSectionReader(readerAtFunc(func(p []byte, offset int64) (retN int, retErr error) {
 		l.resolver.backgroundTaskManager.InvokeBackgroundTask(func(ctx context.Context) {
 			// Measuring the time to download background fetch data (in milliseconds)
@@ -599,6 +705,124 @@ func (l *layer) backgroundFetch(ctx context.Context) error {
 		reader.WithReader(br),                // Read contents in background
 		reader.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
 	)
+}
+
+// layerChunkInfo represents information about a chunk in the layer
+type layerChunkInfo struct {
+	Offset      int64
+	ChunkSize   int64
+	ChunkDigest string
+}
+
+// getAllChunksFromTOC extracts all chunk information from the TOC
+func (l *layer) getAllChunksFromTOC() ([]layerChunkInfo, error) {
+	if l.verifiableReader == nil {
+		return nil, fmt.Errorf("no metadata reader available")
+	}
+
+	metadata := l.verifiableReader.Metadata()
+	if metadata == nil {
+		return nil, fmt.Errorf("no metadata available")
+	}
+
+	var chunks []layerChunkInfo
+
+	// Walk through all files in the metadata to collect chunk information
+	err := l.walkAllFiles(metadata, func(id uint32) error {
+		file, err := metadata.OpenFile(id)
+		if err != nil {
+			return fmt.Errorf("failed to open file %d: %w", id, err)
+		}
+
+		// Get file size to determine iteration range
+		attr, err := metadata.GetAttr(id)
+		if err != nil {
+			return fmt.Errorf("failed to get attributes for file %d: %w", id, err)
+		}
+
+		// Skip empty files
+		if attr.Size == 0 {
+			return nil
+		}
+
+		// Collect all chunks for this file
+		var lastChunkOffset int64 = -1
+		for offset := int64(0); offset < attr.Size; {
+			chunkOffset, chunkSize, chunkDigest, _, ok := file.ChunkEntryForOffset(offset)
+			if !ok {
+				break
+			}
+
+			// Avoid duplicate chunks (multiple files might reference the same chunk)
+			if chunkOffset != lastChunkOffset {
+				chunks = append(chunks, layerChunkInfo{
+					Offset:      chunkOffset,
+					ChunkSize:   chunkSize,
+					ChunkDigest: chunkDigest,
+				})
+				lastChunkOffset = chunkOffset
+			}
+
+			offset += chunkSize
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to walk files: %w", err)
+	}
+
+	// Remove duplicates and sort by offset
+	uniqueChunks := l.deduplicateChunks(chunks)
+
+	log.G(context.Background()).Debugf("collected %d unique chunks from TOC", len(uniqueChunks))
+	return uniqueChunks, nil
+}
+
+// walkAllFiles recursively walks through all files in the metadata
+func (l *layer) walkAllFiles(metadata metadata.Reader, fn func(uint32) error) error {
+	visited := make(map[uint32]bool)
+
+	var walkDir func(uint32) error
+	walkDir = func(dirID uint32) error {
+		if visited[dirID] {
+			return nil
+		}
+		visited[dirID] = true
+
+		return metadata.ForeachChild(dirID, func(name string, childID uint32, mode os.FileMode) bool {
+			if mode.IsRegular() {
+				if err := fn(childID); err != nil {
+					log.G(context.Background()).WithError(err).Debugf("error processing file %d", childID)
+					return false
+				}
+			} else if mode.IsDir() {
+				if err := walkDir(childID); err != nil {
+					log.G(context.Background()).WithError(err).Debugf("error walking directory %d", childID)
+					return false
+				}
+			}
+			return true
+		})
+	}
+
+	return walkDir(metadata.RootID())
+}
+
+// deduplicateChunks removes duplicate chunks based on offset
+func (l *layer) deduplicateChunks(chunks []layerChunkInfo) []layerChunkInfo {
+	seen := make(map[int64]bool)
+	var unique []layerChunkInfo
+
+	for _, chunk := range chunks {
+		if !seen[chunk.Offset] {
+			seen[chunk.Offset] = true
+			unique = append(unique, chunk)
+		}
+	}
+
+	return unique
 }
 
 func (l *layerRef) Done() {

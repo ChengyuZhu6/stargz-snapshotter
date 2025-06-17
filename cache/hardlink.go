@@ -124,10 +124,10 @@ func GetGlobalHardlinkManager(root string) (*HardlinkManager, error) {
 // GetLink gets the file path for a given digest
 func (hm *HardlinkManager) GetLink(chunkdigest string) (string, bool) {
 	hm.mu.RLock()
-	defer hm.mu.RUnlock()
 	log.L.Debugf("Getting link for digest %q", chunkdigest)
 	filePath, exists := hm.digestToFile[chunkdigest]
 	if !exists {
+		hm.mu.RUnlock()
 		return "", false
 	}
 
@@ -135,15 +135,20 @@ func (hm *HardlinkManager) GetLink(chunkdigest string) (string, bool) {
 	if _, err := os.Stat(filePath); err != nil {
 		log.L.Debugf("File for digest %q no longer exists at %q: %v", chunkdigest, filePath, err)
 
-		// We need to acquire a write lock
+		// We need to acquire a write lock, so release the read lock first
 		hm.mu.RUnlock()
 		hm.mu.Lock()
 		defer hm.mu.Unlock()
 
-		delete(hm.digestToFile, chunkdigest)
-		hm.dirty = true
+		// Double-check the mapping still exists after acquiring write lock
+		if _, exists := hm.digestToFile[chunkdigest]; exists {
+			delete(hm.digestToFile, chunkdigest)
+			hm.dirty = true
+		}
 		return "", false
 	}
+
+	hm.mu.RUnlock()
 	log.L.Debugf("Found link for digest %q: %q", chunkdigest, filePath)
 	return filePath, true
 }
