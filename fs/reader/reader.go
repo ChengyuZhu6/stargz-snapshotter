@@ -430,6 +430,7 @@ type file struct {
 // ReadAt reads chunks from the stargz file with trying to fetch as many chunks
 // as possible from the cache.
 func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
+	fmt.Println("!!!!!!!!!!!!!!!! ReadAt = ", offset, "; len(p) = ", len(p))
 	nr := 0
 	for nr < len(p) {
 		chunkOffset, chunkSize, chunkDigestStr, _, ok := sf.fr.ChunkEntryForOffset(offset + int64(nr))
@@ -442,7 +443,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			upperDiscard = positive(chunkOffset + chunkSize - (offset + int64(len(p))))
 			expectedSize = chunkSize - upperDiscard - lowerDiscard
 		)
-
+		fmt.Println("!!!!!!!!!!!!!!!! chunkOffset = ", chunkOffset, "; chunkSize = ", chunkSize, "; upperDiscard = ", upperDiscard, "; lowerDiscard = ", lowerDiscard, "; expectedSize = ", expectedSize)
 		// Check if the content exists in the cache
 		if r, err := sf.gr.cache.Get(id, cache.ChunkDigest(chunkDigestStr)); err == nil {
 			n, err := r.ReadAt(p[nr:int64(nr)+expectedSize], lowerDiscard)

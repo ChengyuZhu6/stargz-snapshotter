@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -120,11 +121,33 @@ func GetGlobalHardlinkManager(root string) (*HardlinkManager, error) {
 
 	return globalHLManager, nil
 }
+func printStack() {
+	pcs := make([]uintptr, 10)   // 10 is the number of stack frames to capture
+	n := runtime.Callers(2, pcs) // Skip 2 frames (printStack and caller)
+	pcs = pcs[:n]
+
+	for _, pc := range pcs {
+		fn := runtime.FuncForPC(pc)
+		file, line := fn.FileLine(pc)
+		fmt.Printf("%s:%d %s\n", file, line, fn.Name())
+	}
+}
+
+func CustomPrint(v ...interface{}) {
+	_, file, line, ok := runtime.Caller(1)
+	if ok {
+		fmt.Printf("********** [debug] %s:%d: ", file, line)
+	}
+	fmt.Println(fmt.Sprint(v...))
+	printStack()
+}
 
 // GetLink gets the file path for a given digest
 func (hm *HardlinkManager) GetLink(chunkdigest string) (string, bool) {
 	hm.mu.RLock()
+
 	log.L.Debugf("Getting link for digest %q", chunkdigest)
+	CustomPrint("GetLink %q", chunkdigest)
 	filePath, exists := hm.digestToFile[chunkdigest]
 	if !exists {
 		hm.mu.RUnlock()
