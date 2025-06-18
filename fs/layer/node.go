@@ -352,7 +352,8 @@ func (n *node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 		ra: ra,
 		fd: -1,
 	}
-
+	var openFlags uint32 = fuse.FOPEN_KEEP_CACHE
+	openFlags |= fuse.FOPEN_DIRECT_IO
 	if n.fs.passThrough.enable {
 		if getter, ok := ra.(reader.PassthroughFdGetter); ok {
 			fd, err := getter.GetPassthroughFd(n.fs.passThrough.mergeBufferSize, n.fs.passThrough.mergeWorkerCount)
@@ -365,7 +366,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 		}
 	}
 
-	return f, fuse.FOPEN_KEEP_CACHE, 0
+	return f, openFlags, 0
 }
 
 var _ = (fusefs.NodeGetattrer)((*node)(nil))
