@@ -58,6 +58,7 @@ func main() {
 			break
 		}
 	}
+
 	app.Commands = append(app.Commands, commands.FanotifyCommand)
 	if err := app.Run(os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "ctr-remote: %v\n", err)

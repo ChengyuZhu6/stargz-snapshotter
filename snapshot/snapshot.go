@@ -17,8 +17,10 @@
 package snapshot
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +33,7 @@ import (
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/containerd/stargz-snapshotter/estargz"
 	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sync/errgroup"
 )
@@ -39,6 +42,8 @@ const (
 	targetSnapshotLabel = "containerd.io/snapshot.ref"
 	remoteLabel         = "containerd.io/snapshot/remote"
 	remoteLabelVal      = "remote snapshot"
+	stargzCommitLabel   = "containerd.io/snapshot/stargz.commit"
+	stargzCommitVal     = "true"
 
 	// remoteSnapshotLogKey is a key for log line, which indicates whether
 	// `Prepare` method successfully prepared targeting remote snapshot or not, as
@@ -338,12 +343,37 @@ func (o *snapshotter) commit(ctx context.Context, isRemote bool, name, key strin
 		return err
 	}
 
+	// Check if this should be a stargz commit
+	var info snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return err
+		}
+	}
+
+	shouldCreateStargz := false
+	if info.Labels != nil {
+		if val, ok := info.Labels[stargzCommitLabel]; ok && val == stargzCommitVal {
+			shouldCreateStargz = true
+		}
+	}
+
 	if !isRemote { // skip diskusage for remote snapshots for allowing lazy preparation of nodes
 		du, err := fs.DiskUsage(ctx, o.upperPath(id))
 		if err != nil {
 			return err
 		}
 		usage = snapshots.Usage(du)
+	}
+
+	// If stargz commit is requested, create stargz blob from the writable layer
+	if shouldCreateStargz && !isRemote {
+		if err := o.createStargzBlob(ctx, id, name, info.Labels); err != nil {
+			log.G(ctx).WithError(err).Warn("failed to create stargz blob from writable layer")
+			// Continue with normal commit even if stargz creation fails
+		} else {
+			log.G(ctx).Info("successfully created stargz blob from writable layer")
+		}
 	}
 
 	if _, err = storage.CommitActive(ctx, key, name, usage, opts...); err != nil {
@@ -665,6 +695,160 @@ func (o *snapshotter) upperPath(id string) string {
 
 func (o *snapshotter) workPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "work")
+}
+
+// createStargzBlob creates a stargz blob from the writable layer
+func (o *snapshotter) createStargzBlob(ctx context.Context, id, name string, labels map[string]string) error {
+	upperPath := o.upperPath(id)
+
+	// Create tar archive from the upper directory
+	tarFile, err := o.createTarFromDirectory(ctx, upperPath)
+	if err != nil {
+		return fmt.Errorf("failed to create tar from directory: %w", err)
+	}
+	defer tarFile.Close()
+	defer os.Remove(tarFile.Name()) // cleanup temp file
+
+	// Get file info for size
+	fileInfo, err := tarFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat tar file: %w", err)
+	}
+
+	// Create SectionReader for estargz.Build
+	tarReader := io.NewSectionReader(tarFile, 0, fileInfo.Size())
+
+	// Convert tar to stargz blob
+	stargzBlob, err := estargz.Build(tarReader)
+	if err != nil {
+		return fmt.Errorf("failed to build stargz from tar: %w", err)
+	}
+	defer stargzBlob.Close()
+
+	// Save stargz blob to output path specified in labels or default location
+	outputPath := o.getStargzOutputPath(name, labels)
+	if err := o.saveStargzBlob(ctx, stargzBlob, outputPath); err != nil {
+		return fmt.Errorf("failed to save stargz blob: %w", err)
+	}
+
+	log.G(ctx).WithField("output", outputPath).WithField("tocDigest", stargzBlob.TOCDigest().String()).
+		Info("stargz blob created successfully")
+
+	return nil
+}
+
+// createTarFromDirectory creates a tar archive from the specified directory
+func (o *snapshotter) createTarFromDirectory(ctx context.Context, dirPath string) (*os.File, error) {
+	// Create temporary file for tar
+	tmpFile, err := os.CreateTemp("", "stargz-commit-*.tar")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	// Create tar writer
+	tarWriter := tar.NewWriter(tmpFile)
+	defer tarWriter.Close()
+
+	// Walk directory and add files to tar
+	err = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip the root directory itself
+		if path == dirPath {
+			return nil
+		}
+
+		// Calculate relative path
+		relPath, err := filepath.Rel(dirPath, path)
+		if err != nil {
+			return err
+		}
+
+		// Create tar header
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+
+		// Write header
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return err
+		}
+
+		// If it's a regular file, write its content
+		if info.Mode().IsRegular() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			if _, err := io.Copy(tarWriter, file); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("failed to create tar: %w", err)
+	}
+
+	// Close tar writer and seek to beginning
+	if err := tarWriter.Close(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("failed to close tar writer: %w", err)
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("failed to seek to beginning: %w", err)
+	}
+
+	return tmpFile, nil
+}
+
+// getStargzOutputPath determines where to save the stargz blob
+func (o *snapshotter) getStargzOutputPath(name string, labels map[string]string) string {
+	// Check if output path is specified in labels
+	if labels != nil {
+		if outputPath, ok := labels["containerd.io/snapshot/stargz.output"]; ok {
+			return outputPath
+		}
+	}
+
+	// Default to snapshots directory with .stargz extension
+	return filepath.Join(o.root, "stargz-blobs", name+".stargz")
+}
+
+// saveStargzBlob saves the stargz blob to the specified path
+func (o *snapshotter) saveStargzBlob(ctx context.Context, blob *estargz.Blob, outputPath string) error {
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Create output file
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outputFile.Close()
+
+	// Copy blob content to output file
+	if _, err := io.Copy(outputFile, blob); err != nil {
+		return fmt.Errorf("failed to copy blob content: %w", err)
+	}
+
+	return nil
 }
 
 // Close closes the snapshotter
