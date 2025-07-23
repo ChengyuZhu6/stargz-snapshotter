@@ -90,7 +90,6 @@ func makeBlob(fetcher fetcher, size int64, chunkSize int64, prefetchChunkSize in
 		checkInterval:     checkInterval,
 		resolver:          r,
 		fetchTimeout:      fetchTimeout,
-		blobDigest:        blobDigest,
 	}
 }
 

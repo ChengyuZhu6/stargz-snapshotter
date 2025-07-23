@@ -190,11 +190,10 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 
 	// Initialize hardlink manager if enabled
 	if config.EnableHardlink {
-		hlManager := InitializeHardlinkManager(filepath.Dir(filepath.Dir(directory)))
-		if hlManager == nil {
+		dc.hlManager = InitializeHardlinkManager(filepath.Dir(filepath.Dir(directory)))
+		if dc.hlManager == nil {
 			return nil, fmt.Errorf("failed to initialize hardlink manager")
 		}
-		dc.hlManager = hlManager
 	}
 
 	return dc, nil
@@ -234,7 +233,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	if !dc.direct && !opt.direct {
 		// Try memory cache for digest or key
 		cacheKey := key
-		if dc.hlManager != nil && dc.hlManager.IsEnabled() && opt.chunkDigest != "" {
+		if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
 			cacheKey = opt.chunkDigest
 		}
 
@@ -264,7 +263,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	filepath := BuildCachePath(dc.directory, key)
 
 	// Check hardlink manager for existing digest file
-	if dc.hlManager != nil && opt.chunkDigest != "" {
+	if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
 		if digestPath, exists := dc.hlManager.ProcessCacheGet(key, opt.chunkDigest, opt.direct); exists {
 			log.L.Debugf("Using existing file for digest %q instead of key %q", opt.chunkDigest, key)
 			filepath = digestPath
@@ -304,7 +303,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		ReaderAt: file,
 		closeFunc: func() error {
 			cacheKey := key
-			if dc.hlManager != nil && dc.hlManager.IsEnabled() && opt.chunkDigest != "" {
+			if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
 				cacheKey = opt.chunkDigest
 			}
 
@@ -543,4 +542,10 @@ func (dc *directoryCache) wrapMemoryWriter(b *bytes.Buffer, w *writer, key strin
 			return nil
 		},
 	}, nil
+}
+
+// shouldUseDigestCacheKey determines whether to use the digest as the cache key.
+// Returns true only if the hardlink manager exists, is enabled, and chunkDigest is not empty.
+func shouldUseDigestCacheKey(hlManager *HardlinkManager, chunkDigest string) bool {
+	return hlManager != nil && hlManager.IsEnabled() && chunkDigest != ""
 }

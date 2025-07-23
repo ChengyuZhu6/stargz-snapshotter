@@ -1160,39 +1160,3 @@ func (cr *countReader) Read(p []byte) (n int, err error) {
 	cr.n += int64(n)
 	return
 }
-
-// GetDigest returns a digest of specified node.
-func (r *reader) GetDigest(id uint32, isChunk bool) (digest string, _ error) {
-	if err := r.view(func(tx *bolt.Tx) error {
-		metadataEntries, err := getMetadata(tx, r.fsID)
-		if err != nil {
-			return fmt.Errorf("metadata bucket of %q not found for getting digest %d: %w", r.fsID, id, err)
-		}
-		nodes, err := getNodes(tx, r.fsID)
-		if err != nil {
-			return err
-		}
-		b, err := getNodeBucketByID(nodes, id)
-		if err != nil {
-			return err
-		}
-		size, _ := binary.Varint(b.Get(bucketKeySize))
-		if md, err := getMetadataBucketByID(metadataEntries, id); err == nil {
-			chunks, err := readChunks(md, size)
-			if err != nil {
-				return err
-			}
-			if len(chunks) > 0 {
-				if isChunk {
-					digest = chunks[0].chunkDigest
-				} else {
-					digest = chunks[0].fileDigest
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		return "", err
-	}
-	return
-}
