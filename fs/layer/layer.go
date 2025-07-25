@@ -425,6 +425,8 @@ type layer struct {
 	prefetchOnce        sync.Once
 	backgroundFetchOnce sync.Once
 	passThrough         passThroughConfig
+
+	backgroundFetchDoneCbs []func()
 }
 
 func (l *layer) Info() Info {
@@ -440,6 +442,10 @@ func (l *layer) Info() Info {
 		ReadTime:     readTime,
 		TOCDigest:    l.verifiableReader.Metadata().TOCDigest(),
 	}
+}
+
+func (l *layer) AddBackgroundFetchDoneCallback(cb func()) {
+	l.backgroundFetchDoneCbs = append(l.backgroundFetchDoneCbs, cb)
 }
 
 func (l *layer) prefetchedSize() int64 {
@@ -566,6 +572,9 @@ func (l *layer) BackgroundFetch() (err error) {
 			return
 		}
 		log.G(ctx).Debug("completed to fetch all layer data in background")
+		for _, cb := range l.backgroundFetchDoneCbs {
+			cb()
+		}
 	})
 	return
 }

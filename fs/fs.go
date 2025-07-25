@@ -242,18 +242,27 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 		}
 	}
 
-	// Resolve the target layer
-	var (
-		resultChan = make(chan layer.Layer)
-		errChan    = make(chan error)
-	)
+	neighborLayers := neighboringLayers(src[0].Manifest, src[0].Target)
+	neighborCount := len(neighborLayers)
+	doneCh := make(chan struct{}, neighborCount+1)
+
+	// 1. Handle target layer (resolve, prefetch, mount, etc.)
+	imageID := src[0].Name.String() + "@" + src[0].Target.Digest.String()
+	var l layer.Layer
+	resultChan := make(chan layer.Layer)
+	errChan := make(chan error)
 	go func() {
 		rErr := fmt.Errorf("failed to resolve target")
 		for _, s := range src {
 			l, err := fs.resolver.Resolve(ctx, s.Hosts, s.Name, s.Target)
 			if err == nil {
-				resultChan <- l
+				if ll, ok := l.(interface{ AddBackgroundFetchDoneCallback(func()) }); ok {
+					ll.AddBackgroundFetchDoneCallback(func() {
+						doneCh <- struct{}{}
+					})
+				}
 				fs.prefetch(ctx, l, defaultPrefetchSize, start)
+				resultChan <- l
 				return
 			}
 			rErr = fmt.Errorf("failed to resolve layer %q from %q: %v: %w", s.Target.Digest, s.Name, err, rErr)
@@ -261,28 +270,39 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 		errChan <- rErr
 	}()
 
-	// Also resolve and cache other layers in parallel
-	preResolve := src[0] // TODO: should we pre-resolve blobs in other sources as well?
-	for _, desc := range neighboringLayers(preResolve.Manifest, preResolve.Target) {
-		desc := desc
+	// 2. Handle neighboring layers (background fetch, aggregation, logging)
+	if neighborCount > 0 {
+		for _, desc := range neighborLayers {
+			desc := desc
+			go func() {
+				ctx2 := log.WithLogger(context.Background(), log.G(ctx).WithField("mountpoint", mountpoint))
+				l, err := fs.resolver.Resolve(ctx2, src[0].Hosts, src[0].Name, desc)
+				if err != nil {
+					log.G(ctx2).WithError(err).Debug("failed to resolve neighbor layer")
+					return
+				}
+				if ll, ok := l.(interface{ AddBackgroundFetchDoneCallback(func()) }); ok {
+					ll.AddBackgroundFetchDoneCallback(func() {
+						doneCh <- struct{}{}
+					})
+				}
+				if !fs.noBackgroundFetch {
+					go l.BackgroundFetch()
+				}
+				fs.prefetch(ctx2, l, defaultPrefetchSize, start)
+				l.Done()
+			}()
+		}
 		go func() {
-			// Avoids to get canceled by client.
-			ctx := log.WithLogger(context.Background(), log.G(ctx).WithField("mountpoint", mountpoint))
-			l, err := fs.resolver.Resolve(ctx, preResolve.Hosts, preResolve.Name, desc)
-			if err != nil {
-				log.G(ctx).WithError(err).Debug("failed to pre-resolve")
-				return
+			for i := 0; i < neighborCount+1; i++ { // +1 for target layer
+				<-doneCh
 			}
-			fs.prefetch(ctx, l, defaultPrefetchSize, start)
-
-			// Release this layer because this isn't target and we don't use it anymore here.
-			// However, this will remain on the resolver cache until eviction.
-			l.Done()
+			if _, loaded := imageDownloadLogged.LoadOrStore(imageID, struct{}{}); !loaded {
+				log.G(ctx).Infof("All layers for image %s have finished background downloading", imageID)
+			}
 		}()
 	}
 
-	// Wait for resolving completion
-	var l layer.Layer
 	select {
 	case l = <-resultChan:
 	case err := <-errChan:
@@ -514,3 +534,5 @@ func isFusermountBinExist() bool {
 	}
 	return false
 }
+
+var imageDownloadLogged sync.Map // key: imageID, value: struct{}
