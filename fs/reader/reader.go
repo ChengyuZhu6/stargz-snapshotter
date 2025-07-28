@@ -236,9 +236,15 @@ func (vr *VerifiableReader) readAndCache(id uint32, fr io.Reader, chunkOffset, c
 		vr.storeLastVerifyErr(retErr)
 	}
 
+	// Parse chunkDigest string to digest.Digest
+	chunkDigestDgst, err := digest.Parse(chunkDigest)
+	if err != nil {
+		return fmt.Errorf("invalid chunk digest %q: %w", chunkDigest, err)
+	}
+
 	// Check if it already exists in the cache
 	cacheID := genID(id, chunkOffset, chunkSize)
-	if r, err := gr.cache.Get(cacheID, cache.ChunkDigest(chunkDigest)); err == nil {
+	if r, err := gr.cache.Get(cacheID, cache.ChunkDigest(chunkDigestDgst)); err == nil {
 		r.Close()
 		return nil
 	}
@@ -248,7 +254,7 @@ func (vr *VerifiableReader) readAndCache(id uint32, fr io.Reader, chunkOffset, c
 	if _, err := br.Peek(int(chunkSize)); err != nil {
 		return fmt.Errorf("cacheWithReader.peek: %v", err)
 	}
-	opts = append(opts, cache.ChunkDigest(chunkDigest))
+	opts = append(opts, cache.ChunkDigest(chunkDigestDgst))
 	w, err := gr.cache.Add(cacheID, opts...)
 	if err != nil {
 		return err
@@ -443,8 +449,14 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			expectedSize = chunkSize - upperDiscard - lowerDiscard
 		)
 
+		// Parse chunkDigestStr to digest.Digest
+		chunkDigestDgst, err := digest.Parse(chunkDigestStr)
+		if err != nil {
+			return 0, fmt.Errorf("invalid chunk digest %q: %w", chunkDigestStr, err)
+		}
+
 		// Check if the content exists in the cache
-		if r, err := sf.gr.cache.Get(id, cache.ChunkDigest(chunkDigestStr)); err == nil {
+		if r, err := sf.gr.cache.Get(id, cache.ChunkDigest(chunkDigestDgst)); err == nil {
 			n, err := r.ReadAt(p[nr:int64(nr)+expectedSize], lowerDiscard)
 			if (err == nil || err == io.EOF) && int64(n) == expectedSize {
 				nr += n
@@ -537,8 +549,14 @@ func (sf *file) GetPassthroughFd(mergeBufferSize int64, mergeWorkerCount int) (u
 
 	id := genID(sf.id, firstChunkOffset, totalSize)
 
+	// Parse fileDigest to digest.Digest
+	fileDigestDgst, err := digest.Parse(fileDigest)
+	if err != nil {
+		return 0, fmt.Errorf("invalid file digest %q: %w", fileDigest, err)
+	}
+
 	// cache.PassThrough() is necessary to take over files
-	r, err := sf.gr.cache.Get(id, cache.PassThrough(), cache.ChunkDigest(fileDigest))
+	r, err := sf.gr.cache.Get(id, cache.PassThrough(), cache.ChunkDigest(fileDigestDgst))
 	if err != nil {
 		if hasLargeChunk {
 			if err := sf.prefetchEntireFileSequential(id); err != nil {
@@ -551,7 +569,7 @@ func (sf *file) GetPassthroughFd(mergeBufferSize int64, mergeWorkerCount int) (u
 		}
 
 		// just retry once to avoid exception stuck
-		r, err = sf.gr.cache.Get(id, cache.PassThrough(), cache.ChunkDigest(fileDigest))
+		r, err = sf.gr.cache.Get(id, cache.PassThrough(), cache.ChunkDigest(fileDigestDgst))
 		if err != nil {
 			return 0, err
 		}
@@ -641,7 +659,13 @@ type batchWorkerArgs struct {
 
 func (sf *file) prefetchEntireFile(entireCacheID string, chunks []chunkData, totalSize int64, bufferSize int64, workerCount int, fileDigest string) error {
 
-	w, err := sf.gr.cache.Add(entireCacheID, cache.ChunkDigest(fileDigest))
+	// Parse fileDigest to digest.Digest
+	fileDigestDgst, err := digest.Parse(fileDigest)
+	if err != nil {
+		return fmt.Errorf("invalid file digest %q: %w", fileDigest, err)
+	}
+
+	w, err := sf.gr.cache.Add(entireCacheID, cache.ChunkDigest(fileDigestDgst))
 	if err != nil {
 		return fmt.Errorf("failed to create cache writer: %w", err)
 	}
@@ -811,7 +835,14 @@ func (gr *reader) verifyOneChunk(entryID uint32, ip []byte, chunkDigestStr strin
 }
 
 func (gr *reader) cacheData(ip []byte, cacheID string, chunkDigestStr string) {
-	if w, err := gr.cache.Add(cacheID, cache.ChunkDigest(chunkDigestStr)); err == nil {
+	// Parse chunkDigestStr to digest.Digest
+	chunkDigestDgst, err := digest.Parse(chunkDigestStr)
+	if err != nil {
+		// log.L.Warnf("invalid chunk digest %q: %v", chunkDigestStr, err) // This line was removed from the new_code, so it's removed here.
+		return
+	}
+
+	if w, err := gr.cache.Add(cacheID, cache.ChunkDigest(chunkDigestDgst)); err == nil {
 		if cn, err := w.Write(ip); err != nil || cn != len(ip) {
 			w.Abort()
 		} else {

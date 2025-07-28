@@ -27,6 +27,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/util/cacheutil"
 	"github.com/containerd/stargz-snapshotter/util/namedmutex"
+	digest "github.com/opencontainers/go-digest"
 )
 
 const (
@@ -102,7 +103,7 @@ type Writer interface {
 type cacheOpt struct {
 	direct      bool
 	passThrough bool
-	chunkDigest string
+	chunkDigest digest.Digest
 }
 
 type Option func(o *cacheOpt) *cacheOpt
@@ -128,7 +129,7 @@ func PassThrough() Option {
 }
 
 // ChunkDigest option allows specifying a chunk digest for the cache
-func ChunkDigest(digest string) Option {
+func ChunkDigest(digest digest.Digest) Option {
 	return func(o *cacheOpt) *cacheOpt {
 		o.chunkDigest = digest
 		return o
@@ -190,9 +191,10 @@ func NewDirectoryCache(directory string, config DirectoryCacheConfig) (BlobCache
 
 	// Initialize hardlink manager if enabled
 	if config.EnableHardlink {
-		dc.hlManager = InitializeHardlinkManager(filepath.Dir(filepath.Dir(directory)))
-		if dc.hlManager == nil {
-			return nil, fmt.Errorf("failed to initialize hardlink manager")
+		var err error
+		dc.hlManager, err = InitializeHardlinkManager(filepath.Dir(filepath.Dir(directory)))
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize hardlink manager: %w", err)
 		}
 	}
 
@@ -233,7 +235,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		// Try memory cache for digest or key
 		cacheKey := key
 		if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
-			cacheKey = opt.chunkDigest
+			cacheKey = opt.chunkDigest.String()
 		}
 
 		if b, done, ok := dc.cache.Get(cacheKey); ok {
@@ -303,7 +305,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 		closeFunc: func() error {
 			cacheKey := key
 			if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
-				cacheKey = opt.chunkDigest
+				cacheKey = opt.chunkDigest.String()
 			}
 
 			_, done, added := dc.fileCache.Add(cacheKey, file)
@@ -331,13 +333,16 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 		keyPath := BuildCachePath(dc.directory, key)
 
 		// Try to create a hardlink from existing digest file
-		if dc.hlManager.ProcessCacheAdd(key, opt.chunkDigest, keyPath) {
+		if err := dc.hlManager.ProcessCacheAdd(key, opt.chunkDigest, keyPath); err == nil {
 			// Return a no-op writer since the file already exists
 			return &writer{
 				WriteCloser: nopWriteCloser(io.Discard),
 				commitFunc:  func() error { return nil },
 				abortFunc:   func() error { return nil },
 			}, nil
+		} else {
+			// If ProcessCacheAdd failed, log the error and continue with normal file creation
+			log.L.Debugf("Hardlink creation failed: %v", err)
 		}
 	}
 
@@ -366,16 +371,16 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 			}
 
 			// If hardlink manager exists and digest is provided, register the file
-			if dc.hlManager != nil && dc.hlManager.IsEnabled() && opt.chunkDigest != "" {
+			if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
 				// Register this file as the primary source for this digest
 				if err := dc.hlManager.RegisterDigestFile(opt.chunkDigest, targetPath); err != nil {
-					log.L.Debugf("Failed to register digest file: %v", err)
+					return fmt.Errorf("failed to register digest file: %w", err)
 				}
 
 				// Map key to digest
 				internalKey := dc.hlManager.GenerateInternalKey(dc.directory, key)
 				if err := dc.hlManager.MapKeyToDigest(internalKey, opt.chunkDigest); err != nil {
-					log.L.Debugf("Failed to map key to digest: %v", err)
+					return fmt.Errorf("failed to map key to digest: %w", err)
 				}
 			}
 
@@ -545,6 +550,6 @@ func (dc *directoryCache) wrapMemoryWriter(b *bytes.Buffer, w *writer, key strin
 
 // shouldUseDigestCacheKey determines whether to use the digest as the cache key.
 // Returns true only if the hardlink manager exists, is enabled, and chunkDigest is not empty.
-func shouldUseDigestCacheKey(hlManager *HardlinkManager, chunkDigest string) bool {
+func shouldUseDigestCacheKey(hlManager *HardlinkManager, chunkDigest digest.Digest) bool {
 	return hlManager != nil && hlManager.IsEnabled() && chunkDigest != ""
 }
