@@ -136,6 +136,7 @@ func (hm *HardlinkManager) GetLink(chunkdigest string) (string, bool) {
 	log.L.Debugf("Getting link for digest %q", chunkdigest)
 	filePath, exists := hm.data.DigestToFile[chunkdigest]
 	if !exists {
+		log.L.Debugf("Digest %q not found in DigestToFile mapping", chunkdigest)
 		return "", false
 	}
 
@@ -150,6 +151,7 @@ func (hm *HardlinkManager) GetLink(chunkdigest string) (string, bool) {
 
 		delete(hm.data.DigestToFile, chunkdigest)
 		hm.dirty = true
+		log.L.Debugf("Removed stale mapping for digest %q", chunkdigest)
 		return "", false
 	}
 	log.L.Debugf("Found link for digest %q: %q", chunkdigest, filePath)
@@ -434,10 +436,17 @@ func (hm *HardlinkManager) CreateLink(key string, chunkdigest string, targetPath
 			if err := os.Link(digestPath, targetPath); err != nil {
 				return fmt.Errorf("failed to create hardlink from digest %q to key %q: %w", chunkdigest, key, err)
 			}
+			log.L.Debugf("Successfully created hardlink from %q to %q for digest %q", digestPath, targetPath, chunkdigest)
+			return nil
+		} else {
+			log.L.Debugf("Skipping hardlink creation: source and target paths are the same for digest %q", chunkdigest)
 			return nil
 		}
 	}
-	return fmt.Errorf("no existing file found for digest %q or source and target paths are the same", chunkdigest)
+
+	// Log debug information instead of returning error
+	log.L.Debugf("No existing file found for digest %q, will create new file instead of hardlink", chunkdigest)
+	return nil
 }
 
 // GenerateInternalKey creates a consistent internal key for a directory and key combination
@@ -477,13 +486,17 @@ func (hm *HardlinkManager) ProcessCacheGet(key string, chunkDigest string, direc
 func (hm *HardlinkManager) ProcessCacheAdd(key string, chunkDigest string, targetPath string) error {
 	// Try to create a hardlink from existing digest file
 	if err := hm.CreateLink(key, chunkDigest, targetPath); err != nil {
+		log.L.Debugf("Hardlink creation failed for digest %q: %v", chunkDigest, err)
 		return fmt.Errorf("failed to create hardlink: %w", err)
 	}
 
 	// Map key to digest
 	internalKey := hm.GenerateInternalKey(filepath.Dir(filepath.Dir(targetPath)), key)
 	if err := hm.MapKeyToDigest(internalKey, chunkDigest); err != nil {
+		log.L.Debugf("Failed to map key to digest for %q: %v", key, err)
 		return fmt.Errorf("failed to map key to digest: %w", err)
 	}
+
+	log.L.Debugf("Successfully processed cache add for key %q with digest %q", key, chunkDigest)
 	return nil
 }
