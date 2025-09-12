@@ -28,6 +28,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
@@ -98,6 +100,14 @@ type FuseManagerConfig struct {
 
 	// Path is path to the fusemanager's executable (default: looking for a binary "stargz-fuse-manager")
 	Path string `toml:"path" json:"path"`
+
+	PerContainer bool `toml:"per_container" json:"per_container"`
+
+	AddressTemplate string `toml:"address_template" json:"address_template"`
+
+	StoreTemplate string `toml:"store_template" json:"store_template"`
+
+	LogTemplate string `toml:"log_template" json:"log_template"`
 }
 
 func main() {
@@ -165,43 +175,66 @@ func main() {
 				log.G(ctx).WithError(err).Fatalf("failed to find fusemanager bin")
 			}
 		}
-		fmAddr := fuseManagerConfig.Address
-		if fmAddr == "" {
-			fmAddr = defaultFuseManagerAddress
-		}
 
-		if !filepath.IsAbs(fmAddr) {
-			log.G(ctx).WithError(err).Fatalf("fuse manager address must be an absolute path: %s", fmAddr)
-		}
-		managerNewlyStarted, err := fusemanager.StartFuseManager(ctx, fmPath, fmAddr, filepath.Join(*rootDir, "fusestore.db"), *logLevel, filepath.Join(*rootDir, "stargz-fuse-manager.log"))
-		if err != nil {
-			log.G(ctx).WithError(err).Fatalf("failed to start fusemanager")
-		}
+		if fuseManagerConfig.PerContainer {
+			// fill default templates if empty
+			if fuseManagerConfig.AddressTemplate == "" {
+				fuseManagerConfig.AddressTemplate = "/run/containerd-stargz-grpc/fuse-manager-{scope}.sock"
+			}
+			if fuseManagerConfig.StoreTemplate == "" {
+				fuseManagerConfig.StoreTemplate = filepath.Join(*rootDir, "fusestore-{scope}.db")
+			}
+			if fuseManagerConfig.LogTemplate == "" {
+				fuseManagerConfig.LogTemplate = filepath.Join(*rootDir, "stargz-fuse-manager-{scope}.log")
+			}
 
-		fuseManagerConfig := fusemanager.Config{
-			Config:                     config.Config,
-			IPFS:                       config.IPFS,
-			MetadataStore:              config.MetadataStore,
-			DefaultImageServiceAddress: defaultImageServiceAddress,
-		}
+			fmCfg := fusemanager.Config{
+				Config:                     config.Config,
+				IPFS:                       config.IPFS,
+				MetadataStore:              config.MetadataStore,
+				DefaultImageServiceAddress: defaultImageServiceAddress,
+			}
+			fs := newPerContainerFS(*rootDir, fmPath, *logLevel, fmCfg, fuseManagerConfig.AddressTemplate, fuseManagerConfig.StoreTemplate, fuseManagerConfig.LogTemplate)
+			var err error
+			rs, err = snbase.NewSnapshotter(ctx, filepath.Join(*rootDir, "snapshotter"), fs, snbase.AsynchronousRemove)
+			if err != nil {
+				log.G(ctx).WithError(err).Fatalf("failed to configure per-container fuse snapshotter")
+			}
+			log.G(ctx).Infof("Start snapshotter with per-container fusemanager mode")
+		} else {
+			fmAddr := fuseManagerConfig.Address
+			if fmAddr == "" {
+				fmAddr = defaultFuseManagerAddress
+			}
+			if !filepath.IsAbs(fmAddr) {
+				log.G(ctx).WithError(err).Fatalf("fuse manager address must be an absolute path: %s", fmAddr)
+			}
+			managerNewlyStarted, err := fusemanager.StartFuseManager(ctx, fmPath, fmAddr, filepath.Join(*rootDir, "fusestore.db"), *logLevel, filepath.Join(*rootDir, "stargz-fuse-manager.log"))
+			if err != nil {
+				log.G(ctx).WithError(err).Fatalf("failed to start fusemanager")
+			}
 
-		fs, err := fusemanager.NewManagerClient(ctx, *rootDir, fmAddr, &fuseManagerConfig)
-		if err != nil {
-			log.G(ctx).WithError(err).Fatalf("failed to configure fusemanager")
+			fmCfg := fusemanager.Config{
+				Config:                     config.Config,
+				IPFS:                       config.IPFS,
+				MetadataStore:              config.MetadataStore,
+				DefaultImageServiceAddress: defaultImageServiceAddress,
+			}
+
+			fs, err := fusemanager.NewManagerClient(ctx, *rootDir, fmAddr, &fmCfg)
+			if err != nil {
+				log.G(ctx).WithError(err).Fatalf("failed to configure fusemanager")
+			}
+			flags := []snbase.Opt{snbase.AsynchronousRemove}
+			if !managerNewlyStarted {
+				flags = append(flags, snbase.NoRestore)
+			}
+			rs, err = snbase.NewSnapshotter(ctx, filepath.Join(*rootDir, "snapshotter"), fs, flags...)
+			if err != nil {
+				log.G(ctx).WithError(err).Fatalf("failed to configure snapshotter")
+			}
+			log.G(ctx).Infof("Start snapshotter with fusemanager mode")
 		}
-		flags := []snbase.Opt{snbase.AsynchronousRemove}
-		// "managerNewlyStarted" being true indicates that the FUSE manager is newly started. To
-		// fully recover the snapshotter and the FUSE manager's state, we need to restore
-		// all snapshot mounts. If managerNewlyStarted is false, the existing FUSE manager maintains
-		// snapshot mounts so we don't need to restore them.
-		if !managerNewlyStarted {
-			flags = append(flags, snbase.NoRestore)
-		}
-		rs, err = snbase.NewSnapshotter(ctx, filepath.Join(*rootDir, "snapshotter"), fs, flags...)
-		if err != nil {
-			log.G(ctx).WithError(err).Fatalf("failed to configure snapshotter")
-		}
-		log.G(ctx).Infof("Start snapshotter with fusemanager mode")
 	} else {
 		crirpc := rpc
 		// For CRI keychain, if listening path is different from stargz-snapshotter's socket, prepare for the dedicated grpc server and the socket.
@@ -365,4 +398,238 @@ func serve(ctx context.Context, rpc *grpc.Server, addr string, rs snapshots.Snap
 		return true, nil // do cleanup on SIGINT
 	}
 	return false, nil
+}
+
+// perContainerFS implements snapshot.FileSystem by delegating to per-scope fusemanager instances.
+type perContainerFS struct {
+	rootDir   string
+	fmPath    string
+	logLevel  string
+	fmCfg     fusemanager.Config
+	addrTmpl  string
+	storeTmpl string
+	logTmpl   string
+
+	mu      sync.RWMutex
+	clients map[string]snbase.FileSystem
+	mpScope map[string]string // mountpoint -> scope
+}
+
+func newPerContainerFS(rootDir, fmPath, logLevel string, fmCfg fusemanager.Config, addrTmpl, storeTmpl, logTmpl string) *perContainerFS {
+	return &perContainerFS{
+		rootDir:   rootDir,
+		fmPath:    fmPath,
+		logLevel:  logLevel,
+		fmCfg:     fmCfg,
+		addrTmpl:  addrTmpl,
+		storeTmpl: storeTmpl,
+		logTmpl:   logTmpl,
+		clients:   make(map[string]snbase.FileSystem),
+		mpScope:   make(map[string]string),
+	}
+}
+
+func (p *perContainerFS) scopeFromLabels(labels map[string]string) string {
+	// 优先使用 Pod UID 或 Sandbox ID，这些在 CRI/K8s 环境最稳定
+	keys := []string{
+		"io.kubernetes.pod.uid",
+		"io.kubernetes.sandbox.id",
+		"io.cri-containerd.sandbox-id",
+		"containerd.io/snapshot/labels.io.kubernetes.pod.uid",
+		// 次选：容器名/CRI容器名（可能不唯一）
+		"io.kubernetes.container.name",
+		"containerd.io/snapshot/cri.container-name",
+	}
+	for _, k := range keys {
+		if v, ok := labels[k]; ok && v != "" {
+			return sanitizeScope(v)
+		}
+	}
+	// 再次回退：snapshot key
+	if v, ok := labels["containerd.io/snapshot/key"]; ok && v != "" {
+		return sanitizeScope(v)
+	}
+	// 最后回退：default（Mount 时会进一步用 mountpoint hash 覆盖）
+	return "default"
+}
+
+func sanitizeScope(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	out := b.String()
+	if len(out) > 80 {
+		out = out[:80]
+	}
+	return out
+}
+
+// shortHash 返回字符串的短十六进制哈希（非加密），用于生成短 scope
+func shortHash(s string) string {
+	// FNV-1a 32 位
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	// 8位十六进制
+	return fmt.Sprintf("%08x", h)
+}
+
+func (p *perContainerFS) render(tmpl, scope string) string {
+	return strings.ReplaceAll(tmpl, "{scope}", scope)
+}
+
+func (p *perContainerFS) ensureClient(ctx context.Context, scope string) (snbase.FileSystem, error) {
+	p.mu.RLock()
+	if c, ok := p.clients[scope]; ok {
+		p.mu.RUnlock()
+		return c, nil
+	}
+	p.mu.RUnlock()
+
+	socket := p.render(p.addrTmpl, scope)
+	store := p.render(p.storeTmpl, scope)
+	logp := p.render(p.logTmpl, scope)
+
+	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
+		return nil, fmt.Errorf("prepare socket dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(store), 0700); err != nil {
+		return nil, fmt.Errorf("prepare store dir: %w", err)
+	}
+	if dir := filepath.Dir(logp); dir != "" {
+		_ = os.MkdirAll(dir, 0700)
+	}
+
+	if _, err := fusemanager.StartFuseManager(ctx, p.fmPath, socket, store, p.logLevel, logp); err != nil {
+		return nil, fmt.Errorf("start fusemanager(scope=%s): %w", scope, err)
+	}
+	cli, err := fusemanager.NewManagerClient(ctx, p.rootDir, socket, &p.fmCfg)
+	if err != nil {
+		return nil, fmt.Errorf("new manager client(scope=%s): %w", scope, err)
+	}
+
+	p.mu.Lock()
+	p.clients[scope] = cli
+	p.mu.Unlock()
+	return cli, nil
+}
+
+func (p *perContainerFS) withClient(ctx context.Context, labels map[string]string) (snbase.FileSystem, string, error) {
+	scope := p.scopeFromLabels(labels)
+	cli, err := p.ensureClient(ctx, scope)
+	if err != nil {
+		p.mu.Lock()
+		delete(p.clients, scope)
+		p.mu.Unlock()
+		cli, err = p.ensureClient(ctx, scope)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return cli, scope, nil
+}
+
+func (p *perContainerFS) Mount(ctx context.Context, mountpoint string, labels map[string]string) error {
+	// 如果 labels 不含我们需要的信息，避免所有容器落到 "default"
+	scope := p.scopeFromLabels(labels)
+	if scope == "default" {
+		// 基于 mountpoint 生成简短稳定 scope，避免路径过长
+		scope = sanitizeScope(shortHash(mountpoint))
+	}
+	// 先确保 client，再执行 Mount
+	cli, err := p.ensureClient(ctx, scope)
+	if err != nil {
+		// 重建一次
+		p.mu.Lock()
+		delete(p.clients, scope)
+		p.mu.Unlock()
+		cli, err = p.ensureClient(ctx, scope)
+		if err != nil {
+			return err
+		}
+	}
+	if err := cli.Mount(ctx, mountpoint, labels); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.mpScope[mountpoint] = scope
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *perContainerFS) Check(ctx context.Context, mountpoint string, labels map[string]string) error {
+	p.mu.RLock()
+	scope, ok := p.mpScope[mountpoint]
+	p.mu.RUnlock()
+	var cli snbase.FileSystem
+	var err error
+	if ok {
+		cli, err = p.ensureClient(ctx, scope)
+		if err != nil {
+			p.mu.Lock()
+			delete(p.clients, scope)
+			p.mu.Unlock()
+			cli, err = p.ensureClient(ctx, scope)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		cli, _, err = p.withClient(ctx, labels)
+		if err != nil {
+			return err
+		}
+	}
+	return cli.Check(ctx, mountpoint, labels)
+}
+
+func (p *perContainerFS) Unmount(ctx context.Context, mountpoint string) error {
+	p.mu.RLock()
+	scope, ok := p.mpScope[mountpoint]
+	p.mu.RUnlock()
+	if !ok {
+		p.mu.RLock()
+		var firstErr error
+		for s, cli := range p.clients {
+			_ = s
+			if err := cli.Unmount(ctx, mountpoint); err == nil {
+				p.mu.RUnlock()
+				p.mu.Lock()
+				delete(p.mpScope, mountpoint)
+				p.mu.Unlock()
+				return nil
+			} else if firstErr == nil {
+				firstErr = err
+			}
+		}
+		p.mu.RUnlock()
+		if firstErr != nil {
+			return firstErr
+		}
+		return fmt.Errorf("unknown scope for mountpoint %s", mountpoint)
+	}
+	cli, err := p.ensureClient(ctx, scope)
+	if err != nil {
+		p.mu.Lock()
+		delete(p.clients, scope)
+		p.mu.Unlock()
+		cli, err = p.ensureClient(ctx, scope)
+		if err != nil {
+			return err
+		}
+	}
+	if err := cli.Unmount(ctx, mountpoint); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	delete(p.mpScope, mountpoint)
+	p.mu.Unlock()
+	return nil
 }
