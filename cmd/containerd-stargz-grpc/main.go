@@ -430,26 +430,38 @@ func newPerContainerFS(rootDir, fmPath, logLevel string, fmCfg fusemanager.Confi
 }
 
 func (p *perContainerFS) scopeFromLabels(labels map[string]string) string {
-	// 优先使用 Pod UID 或 Sandbox ID，这些在 CRI/K8s 环境最稳定
-	keys := []string{
-		"io.kubernetes.pod.uid",
-		"io.kubernetes.sandbox.id",
-		"io.cri-containerd.sandbox-id",
-		"containerd.io/snapshot/labels.io.kubernetes.pod.uid",
-		// 次选：容器名/CRI容器名（可能不唯一）
-		"io.kubernetes.container.name",
-		"containerd.io/snapshot/cri.container-name",
+	// 以镜像为粒度：优先使用镜像 digest，其次 image ref，其它镜像相关键兜底
+	// 常见 digest 键
+	digestKeys := []string{
+		"containerd.io/snapshot/labels.io.cri-image.digest",
+		"io.cri-image.digest",
+		"containerd.io/image.digest",
 	}
-	for _, k := range keys {
+	for _, k := range digestKeys {
 		if v, ok := labels[k]; ok && v != "" {
 			return sanitizeScope(v)
 		}
 	}
+
+	// 常见 image reference 键
+	refKeys := []string{
+		"containerd.io/snapshot/labels.containerd.io/image.ref",
+		"containerd.io/image.ref",
+		"io.kubernetes.cri.image",
+		"containerd.io/snapshot/image",
+	}
+	for _, k := range refKeys {
+		if v, ok := labels[k]; ok && v != "" {
+			return sanitizeScope(v)
+		}
+	}
+
 	// 再次回退：snapshot key
 	if v, ok := labels["containerd.io/snapshot/key"]; ok && v != "" {
 		return sanitizeScope(v)
 	}
-	// 最后回退：default（Mount 时会进一步用 mountpoint hash 覆盖）
+
+	// 最后回退：default（Mount 时会用 mountpoint 的短哈希替代）
 	return "default"
 }
 
