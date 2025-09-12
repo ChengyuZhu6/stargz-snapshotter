@@ -739,16 +739,24 @@ func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
 		}
 	}
 
-	var task []snapshots.Info
+	var remoteTask []snapshots.Info
+	var normalTask []snapshots.Info
+
+	// Collect both remote and normal snapshots
 	if err := o.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
 		if _, ok := info.Labels[remoteLabel]; ok {
-			task = append(task, info)
+			remoteTask = append(remoteTask, info)
+		} else {
+			// Also collect normal snapshots that need directory restoration
+			normalTask = append(normalTask, info)
 		}
 		return nil
 	}); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
-	for _, info := range task {
+
+	// Restore remote snapshots (existing logic)
+	for _, info := range remoteTask {
 		// First, prepare the snapshot directory
 		if err := func() error {
 			ctx, t, err := o.ms.TransactionContext(ctx, false)
@@ -773,13 +781,45 @@ func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
 		if err := o.prepareRemoteSnapshot(ctx, info.Name, info.Labels); err != nil {
 			if o.allowInvalidMountsOnRestart {
 				log.G(ctx).WithError(err).Warnf("failed to restore remote snapshot %s; remove this snapshot manually", info.Name)
-				// This snapshot mount is invalid but allow this.
-				// NOTE: snapshotter.Mount() will fail to return the mountpoint of these invalid snapshots so
-				//       containerd cannot use them anymore. User needs to manually remove the snapshots from
-				//       containerd's metadata store using ctr (e.g. `ctr snapshot rm`).
 				continue
 			}
 			return fmt.Errorf("failed to prepare remote snapshot: %s: %w", info.Name, err)
+		}
+	}
+
+	// Restore normal snapshots (new logic)
+	for _, info := range normalTask {
+		// Check if directory already exists
+		ctx, t, err := o.ms.TransactionContext(ctx, false)
+		if err != nil {
+			return err
+		}
+		id, _, _, err := storage.GetInfo(ctx, info.Name)
+		t.Rollback()
+		if err != nil {
+			log.G(ctx).WithError(err).Warnf("failed to get info for normal snapshot %s", info.Name)
+			continue
+		}
+
+		snapshotPath := filepath.Join(o.root, "snapshots", id)
+		if _, err := os.Stat(snapshotPath); os.IsNotExist(err) {
+			// Directory doesn't exist, create it
+			log.G(ctx).Infof("restoring normal snapshot directory: %s", snapshotPath)
+			if err := os.Mkdir(snapshotPath, 0700); err != nil {
+				log.G(ctx).WithError(err).Warnf("failed to create normal snapshot directory: %s", snapshotPath)
+				continue
+			}
+			if err := os.Mkdir(o.upperPath(id), 0755); err != nil {
+				log.G(ctx).WithError(err).Warnf("failed to create normal snapshot fs directory: %s", o.upperPath(id))
+				continue
+			}
+			// For active snapshots, also create work directory
+			if info.Kind == snapshots.KindActive {
+				if err := os.Mkdir(o.workPath(id), 0711); err != nil {
+					log.G(ctx).WithError(err).Warnf("failed to create normal snapshot work directory: %s", o.workPath(id))
+					continue
+				}
+			}
 		}
 	}
 
