@@ -455,17 +455,16 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context, t storage.Trans
 		return nil, err
 	}
 
-	// When cleaning committed snapshots, filter ids to only include remote snapshots
-	if cleanupCommitted {
+	remoteSnapshotNames := make(map[string]struct{})
+	{
 		keyToID := make(map[string]string, len(ids))
 		for id, key := range ids {
 			keyToID[key] = id
 		}
-
 		if err := storage.WalkInfo(ctx, func(ctx context.Context, info snapshots.Info) error {
-			if _, ok := info.Labels[remoteLabel]; !ok {
+			if _, ok := info.Labels[remoteLabel]; ok {
 				if id, exists := keyToID[info.Name]; exists {
-					delete(ids, id)
+					remoteSnapshotNames[id] = struct{}{}
 				}
 			}
 			return nil
@@ -476,10 +475,14 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context, t storage.Trans
 
 	cleanup := []string{}
 	for _, d := range dirs {
-		exists := ids[d] != ""
-
-		if cleanupCommitted != exists {
-			continue
+		if !cleanupCommitted {
+			if _, ok := ids[d]; ok {
+				continue
+			}
+		} else {
+			if _, ok := remoteSnapshotNames[d]; !ok {
+				continue
+			}
 		}
 
 		cleanup = append(cleanup, filepath.Join(snapshotDir, d))
