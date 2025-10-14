@@ -239,10 +239,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	// Try to get from memory cache
 	if !dc.direct && !opt.direct {
 		// Try memory cache for digest or key, with namespaced keys to avoid collisions
-		cacheKey := cacheKeyPrefixRaw + key
-		if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
-			cacheKey = cacheKeyPrefixDigest + opt.chunkDigest
-		}
+		cacheKey := getCacheKey(dc.hlManager, key, opt.chunkDigest)
 
 		if b, done, ok := dc.cache.Get(cacheKey); ok {
 			return &reader{
@@ -314,10 +311,7 @@ func (dc *directoryCache) Get(key string, opts ...Option) (Reader, error) {
 	return &reader{
 		ReaderAt: file,
 		closeFunc: func() error {
-			cacheKey := cacheKeyPrefixRaw + key
-			if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
-				cacheKey = cacheKeyPrefixDigest + opt.chunkDigest
-			}
+			cacheKey := getCacheKey(dc.hlManager, key, opt.chunkDigest)
 
 			_, done, added := dc.fileCache.Add(cacheKey, file)
 			defer done() // Release it immediately. Cleaned up on eviction.
@@ -384,13 +378,8 @@ func (dc *directoryCache) Add(key string, opts ...Option) (Writer, error) {
 			}
 
 			if shouldUseDigestCacheKey(dc.hlManager, opt.chunkDigest) {
-				if err := dc.hlManager.RegisterDigestFile(opt.chunkDigest, targetPath); err != nil {
+				if err := dc.hlManager.RegisterDigestFile(opt.chunkDigest, targetPath, dc.directory, key); err != nil {
 					return fmt.Errorf("failed to register digest file: %w", err)
-				}
-
-				internalKey := dc.hlManager.GenerateInternalKey(dc.directory, key)
-				if err := dc.hlManager.MapKeyToDigest(internalKey, opt.chunkDigest); err != nil {
-					return fmt.Errorf("failed to map key to digest: %w", err)
 				}
 			}
 
@@ -575,6 +564,15 @@ func (dc *directoryCache) wrapMemoryWriter(b *bytes.Buffer, w *writer, key strin
 // Returns true only if the hardlink manager exists, is enabled, and chunkDigest is not empty.
 func shouldUseDigestCacheKey(hlManager *hardlink.Manager, chunkDigest string) bool {
 	return hlManager != nil && hlManager.IsEnabled() && chunkDigest != ""
+}
+
+// getCacheKey returns the appropriate cache key based on whether digest-based caching should be used.
+// If digest-based caching is enabled, it returns a key with the digest prefix, otherwise with the raw key prefix.
+func getCacheKey(hlManager *hardlink.Manager, key string, chunkDigest string) string {
+	if shouldUseDigestCacheKey(hlManager, chunkDigest) {
+		return cacheKeyPrefixDigest + chunkDigest
+	}
+	return cacheKeyPrefixRaw + key
 }
 
 func buildCachePath(directory string, key string) string {

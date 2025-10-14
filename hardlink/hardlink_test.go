@@ -25,6 +25,14 @@ import (
 	"time"
 )
 
+// getDigestForKey is a test helper function that returns the digest mapped to the given key, if any.
+func (hm *Manager) getDigestForKey(key string) (string, bool) {
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
+	d, ok := hm.keyToDigest[key]
+	return d, ok
+}
+
 // Common test setup helper
 func setupTestEnvironment(t *testing.T) (string, string, string, *Manager) {
 	t.Helper()
@@ -60,7 +68,7 @@ func TestManager_RegisterAndGetDigest(t *testing.T) {
 	testDigest := generateTestDigest("test content")
 
 	t.Run("RegisterAndRetrieveDigest", func(t *testing.T) {
-		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile, "", ""); err != nil {
 			t.Fatalf("RegisterDigestFile failed: %v", err)
 		}
 		filePath, exists := hlm.GetLink(testDigest)
@@ -75,7 +83,7 @@ func TestManager_RegisterAndGetDigest(t *testing.T) {
 	t.Run("NonExistentFile", func(t *testing.T) {
 		nonExistentFile := filepath.Join(t.TempDir(), "nonexistent.txt")
 		nonexistentDigest := "sha256:nonexistent"
-		err := hlm.RegisterDigestFile(nonexistentDigest, nonExistentFile)
+		err := hlm.RegisterDigestFile(nonexistentDigest, nonExistentFile, "", "")
 		if err == nil {
 			t.Fatal("should fail with nonexistent file")
 		}
@@ -96,14 +104,14 @@ func TestManager_MapKeyToDigest(t *testing.T) {
 	testDigest := generateTestDigest("test content")
 
 	t.Run("MapKeyAndGetDigest", func(t *testing.T) {
-		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile, "", ""); err != nil {
 			t.Fatalf("RegisterDigestFile failed: %v", err)
 		}
 		key := "test-key"
 		if err := hlm.MapKeyToDigest(key, testDigest); err != nil {
 			t.Fatalf("MapKeyToDigest failed: %v", err)
 		}
-		mappedDigest, exists := hlm.GetDigestForKey(key)
+		mappedDigest, exists := hlm.getDigestForKey(key)
 		if !exists {
 			t.Fatal("key should be mapped to digest")
 		}
@@ -127,7 +135,7 @@ func TestManager_MapKeyToDigest(t *testing.T) {
 			t.Fatalf("failed to create another file: %v", err)
 		}
 		anotherDigest := generateTestDigest("different content")
-		if err := hlm.RegisterDigestFile(anotherDigest, anotherFile); err != nil {
+		if err := hlm.RegisterDigestFile(anotherDigest, anotherFile, "", ""); err != nil {
 			t.Fatalf("RegisterDigestFile failed for another digest: %v", err)
 		}
 		key := "remap-key"
@@ -140,7 +148,7 @@ func TestManager_MapKeyToDigest(t *testing.T) {
 		if err := hlm.MapKeyToDigest(key, anotherDigest); err != nil {
 			t.Fatalf("MapKeyToDigest failed for remapping: %v", err)
 		}
-		mappedDigest, exists := hlm.GetDigestForKey(key)
+		mappedDigest, exists := hlm.getDigestForKey(key)
 		if !exists {
 			t.Fatal("key should still be mapped")
 		}
@@ -163,7 +171,7 @@ func TestManager_CreateLink(t *testing.T) {
 	testDigest := generateTestDigest("test content")
 
 	t.Run("SuccessfulHardlink", func(t *testing.T) {
-		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile, "", ""); err != nil {
 			t.Fatalf("RegisterDigestFile failed: %v", err)
 		}
 		targetPath := filepath.Join(tmpDir, "hardlink-target.txt")
@@ -184,7 +192,7 @@ func TestManager_CreateLink(t *testing.T) {
 	})
 
 	t.Run("SamePathHardlink", func(t *testing.T) {
-		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile, "", ""); err != nil {
 			t.Fatalf("RegisterDigestFile failed: %v", err)
 		}
 		if err := hlm.CreateLink("same-path-key", testDigest, sourceFile); err == nil {
@@ -199,14 +207,14 @@ func TestManager_InMemoryState(t *testing.T) {
 	testDigest := generateTestDigest("test content")
 
 	t.Run("StateAvailable", func(t *testing.T) {
-		if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+		if err := hlm.RegisterDigestFile(testDigest, sourceFile, "", ""); err != nil {
 			t.Fatalf("RegisterDigestFile failed: %v", err)
 		}
 		key := "persist-test"
 		if err := hlm.MapKeyToDigest(key, testDigest); err != nil {
 			t.Fatalf("MapKeyToDigest failed: %v", err)
 		}
-		digest, exists := hlm.GetDigestForKey(key)
+		digest, exists := hlm.getDigestForKey(key)
 		if !exists {
 			t.Fatal("key mapping should exist")
 		}
@@ -227,7 +235,7 @@ func TestManager_InMemoryState(t *testing.T) {
 func TestManager_Concurrent(t *testing.T) {
 	_, _, sourceFile, hlm := setupTestEnvironment(t)
 	testDigest := generateTestDigest("test content")
-	if err := hlm.RegisterDigestFile(testDigest, sourceFile); err != nil {
+	if err := hlm.RegisterDigestFile(testDigest, sourceFile, "", ""); err != nil {
 		t.Fatalf("RegisterDigestFile failed: %v", err)
 	}
 	done := make(chan bool)

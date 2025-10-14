@@ -81,7 +81,9 @@ func NewHardlinkManager() (*Manager, error) {
 	return hm, nil
 }
 
-// GetLink gets the file path for a given digest
+// GetLink gets the file path for a given digest.
+// This returns the source file path that was registered through RegisterDigestFile.
+// The returned file path can be used as a source for creating hardlinks via CreateLink.
 func (hm *Manager) GetLink(chunkdigest string) (string, bool) {
 	v, done, ok := hm.digestToFile.Get(chunkdigest)
 	if !ok {
@@ -96,13 +98,23 @@ func (hm *Manager) GetLink(chunkdigest string) (string, bool) {
 	return filePath, true
 }
 
-// RegisterDigestFile registers a file as the primary source for a digest
-func (hm *Manager) RegisterDigestFile(chunkdigest string, filePath string) error {
+// RegisterDigestFile registers a file as the primary source for a digest.
+// If directory and key are provided, it also maps the key to the digest.
+func (hm *Manager) RegisterDigestFile(chunkdigest string, filePath string, directory string, key string) error {
 	if _, err := os.Stat(filePath); err != nil {
 		return fmt.Errorf("file does not exist at %q: %w", filePath, err)
 	}
 	_, done, _ := hm.digestToFile.Add(chunkdigest, filePath)
 	done()
+
+	// If directory and key are provided, map the key to the digest
+	if directory != "" && key != "" {
+		internalKey := hm.GenerateInternalKey(directory, key)
+		if err := hm.MapKeyToDigest(internalKey, chunkdigest); err != nil {
+			return fmt.Errorf("failed to map key to digest: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -145,16 +157,9 @@ func (hm *Manager) MapKeyToDigest(key string, chunkdigest string) error {
 	return nil
 }
 
-// GetDigestForKey returns the digest mapped to the given key, if any.
-func (hm *Manager) GetDigestForKey(key string) (string, bool) {
-	hm.mu.RLock()
-	defer hm.mu.RUnlock()
-	d, ok := hm.keyToDigest[key]
-	return d, ok
-}
-
-// CreateLink attempts to create a hardlink from an existing digest file to a key path
-// Returns nil if successful, error otherwise
+// CreateLink attempts to create a hardlink from an existing digest file to a key path.
+// It uses the source file registered via RegisterDigestFile as the hardlink source.
+// Returns nil if successful, error otherwise.
 func (hm *Manager) CreateLink(key string, chunkdigest string, targetPath string) error {
 	if digestPath, exists := hm.GetLink(chunkdigest); exists {
 		if digestPath != targetPath {
