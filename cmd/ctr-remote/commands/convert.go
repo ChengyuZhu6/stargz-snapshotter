@@ -22,8 +22,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/cmd/ctr/commands"
 	"github.com/containerd/containerd/v2/core/content"
@@ -251,7 +254,11 @@ When '--all-platforms' is given all images in a manifest list must be available.
 			case <-ctx.Done():
 			}
 		}()
+		// Start lightweight progress output to stderr while converting
+		stopProgress := startConvertProgress(ctx, client.ContentStore(), os.Stderr)
 		newImg, err := converter.Convert(ctx, client, targetRef, srcRef, convertOpts...)
+		// Stop progress printing regardless of succeed/fail
+		stopProgress()
 		if err != nil {
 			return err
 		}
@@ -334,4 +341,123 @@ func readPathsFromRecordFile(filename string) ([]string, error) {
 		}
 	}
 	return paths, nil
+}
+
+// startConvertProgress prints a lightweight progress indicator for active content writes
+// initiated by conversion. It writes to "out" (use stderr to avoid interfering with stdout).
+// Call the returned function to stop and print a trailing newline.
+func startConvertProgress(ctx gocontext.Context, cs content.Store, out io.Writer) func() {
+	ctx, cancel := gocontext.WithCancel(ctx)
+	// Print only if we have a writer
+	if out == nil {
+		return cancel
+	}
+	go func() {
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		var lastLine string
+		for {
+			select {
+			case <-ctx.Done():
+				if lastLine != "" {
+					fmt.Fprintln(out)
+				}
+				return
+			case <-t.C:
+				st, err := cs.ListStatuses(ctx)
+				if err != nil {
+					continue
+				}
+				var (
+					total  int64
+					offset int64
+					active int
+				)
+				for _, s := range st {
+					if !isConvertRef(s.Ref) {
+						continue
+					}
+					active++
+					// Prefer Total when available
+					if s.Total > 0 {
+						total += s.Total
+					}
+					offset += s.Offset
+				}
+				if active == 0 {
+					// Clear line once, then keep quiet until something appears again
+					if lastLine != "" {
+						fmt.Fprint(out, "\r")
+						fmt.Fprint(out, spaces(len(lastLine)))
+						fmt.Fprint(out, "\r")
+						lastLine = ""
+					}
+					continue
+				}
+				if total > 0 {
+					pct := (offset * 100) / total
+					line := fmt.Sprintf("Converting: %d active, %s/%s (%d%%)", active, humanBytes(offset), humanBytes(total), pct)
+					// Erase previous line and print updated line in-place
+					fmt.Fprint(out, "\r")
+					if len(lastLine) > len(line) {
+						fmt.Fprint(out, spaces(len(lastLine)))
+						fmt.Fprint(out, "\r")
+					}
+					fmt.Fprint(out, line)
+					lastLine = line
+					continue
+				}
+				line := fmt.Sprintf("Converting: %d active, written %s", active, humanBytes(offset))
+				// Erase previous line and print updated line in-place
+				fmt.Fprint(out, "\r")
+				if len(lastLine) > len(line) {
+					fmt.Fprint(out, spaces(len(lastLine)))
+					fmt.Fprint(out, "\r")
+				}
+				fmt.Fprint(out, line)
+				lastLine = line
+			}
+		}
+	}()
+	return func() {
+		cancel()
+	}
+}
+
+func isConvertRef(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	if strings.HasPrefix(ref, "convert-estargz-from-") || strings.HasPrefix(ref, "convert-zstdchunked-from-") {
+		return true
+	}
+	// Include auxiliary writes used by external TOC finalize path
+	if strings.HasPrefix(ref, "external-toc") || strings.HasPrefix(ref, "write-json-ref") {
+		return true
+	}
+	return false
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		exp++
+		div *= unit
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func spaces(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = ' '
+	}
+	return string(b)
 }
